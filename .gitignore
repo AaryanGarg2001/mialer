@@ -96,6 +96,7 @@ Thumbs.db
 # Temporary files
 tmp/
 temp/
+digest.txt
 
 # Docker
 .dockerignore

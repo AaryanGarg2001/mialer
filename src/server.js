@@ -11,6 +11,10 @@ const { errorHandler, notFound } = require('./middleware/error.middleware');
 
 // Import routes
 const healthRoutes = require('./routes/health.routes');
+const authRoutes = require('./routes/auth.routes');
+const aiRoutes = require('./routes/ai.routes');
+const emailRoutes = require('./routes/email.routes');
+const personaRoutes = require('./routes/persona.routes');
 
 class Server {
   constructor() {
@@ -93,6 +97,10 @@ class Server {
   initializeRoutes() {
     // API routes
     this.app.use('/health', healthRoutes);
+    this.app.use('/auth', authRoutes);
+    this.app.use('/ai', aiRoutes);
+    this.app.use('/email', emailRoutes);
+    this.app.use('/persona', personaRoutes);
 
     // Root endpoint
     this.app.get('/', (req, res) => {
@@ -108,6 +116,14 @@ class Server {
           healthDatabase: '/health/database',
           readiness: '/health/ready',
           liveness: '/health/live',
+          auth: '/auth',
+          gmailAuth: '/auth/gmail',
+          gmailCallback: '/auth/gmail/callback',
+          userProfile: '/auth/me',
+          ai: '/ai',
+          aiHealth: '/ai/health',
+          emailSummary: '/ai/summarize-email',
+          dailySummary: '/ai/daily-summary',
         },
       });
     });
@@ -148,6 +164,66 @@ class Server {
             path: '/health/live',
             method: 'GET',
             description: 'Kubernetes liveness probe',
+          },
+          // Authentication endpoints
+          gmailAuth: {
+            path: '/auth/gmail',
+            method: 'GET',
+            description: 'Initiate Gmail OAuth flow',
+          },
+          gmailCallback: {
+            path: '/auth/gmail/callback',
+            method: 'GET',
+            description: 'Gmail OAuth callback handler',
+          },
+          userProfile: {
+            path: '/auth/me',
+            method: 'GET',
+            description: 'Get current user profile',
+            auth: 'required',
+          },
+          connections: {
+            path: '/auth/connections',
+            method: 'GET',
+            description: 'Get email provider connections',
+            auth: 'required',
+          },
+          gmailRefresh: {
+            path: '/auth/gmail/refresh',
+            method: 'POST',
+            description: 'Refresh Gmail access token',
+            auth: 'required',
+          },
+          // AI endpoints
+          aiHealth: {
+            path: '/ai/health',
+            method: 'GET',
+            description: 'Check AI service health',
+            auth: 'required',
+          },
+          aiInfo: {
+            path: '/ai/info',
+            method: 'GET',
+            description: 'Get AI service capabilities',
+            auth: 'required',
+          },
+          emailSummary: {
+            path: '/ai/summarize-email',
+            method: 'POST',
+            description: 'Generate email summary',
+            auth: 'required',
+          },
+          dailySummary: {
+            path: '/ai/daily-summary',
+            method: 'POST',
+            description: 'Generate daily email summary',
+            auth: 'required',
+          },
+          askAI: {
+            path: '/ai/ask',
+            method: 'POST',
+            description: 'Ask questions about emails',
+            auth: 'required',
           },
         },
       });
