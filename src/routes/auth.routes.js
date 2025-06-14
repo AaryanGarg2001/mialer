@@ -2,6 +2,7 @@ const express = require('express');
 const authController = require('../controllers/auth.controller');
 const { authenticate, requireGmail, optionalAuth } = require('../middleware/auth.middleware');
 const { asyncHandler } = require('../middleware/error.middleware');
+const User = require('../models/User.model');
 
 const router = express.Router();
 
@@ -85,7 +86,6 @@ router.get('/status', optionalAuth, asyncHandler(async (req, res) => {
  * @access Private
  */
 router.get('/gmail/status', authenticate, asyncHandler(async (req, res) => {
-  const User = require('../models/user.model');
   const { successResponse, errorResponse } = require('../utils/response');
   
   try {

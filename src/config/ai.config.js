@@ -142,7 +142,7 @@ class AIConfig {
     const provider = providerName ? this.providers[providerName] : this.getCurrentProvider();
     
     const client = axios.create({
-      baseURL: provider.baseURL,
+      baseURL: provider?.baseURL,
       timeout: 30000, // 30 second timeout
       headers: {
         'Content-Type': 'application/json',

@@ -50,7 +50,7 @@ class Database {
         serverSelectionTimeoutMS: parseInt(process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS, 10) || 5000, // How long the driver will try to find a server before timing out.
         socketTimeoutMS: parseInt(process.env.MONGODB_SOCKET_TIMEOUT_MS, 10) || 45000, // How long a send or receive on a socket can take before timing out.
         bufferCommands: false, // Disable Mongoose's buffering mechanism for commands.
-        bufferMaxEntries: 0,   // If bufferCommands is false, this option is ignored.
+        // bufferMaxEntries: 0,   // If bufferCommands is false, this option is ignored.
         // family: 4, // Use IPv4, skip trying IPv6 - useful in some environments
       };
 
