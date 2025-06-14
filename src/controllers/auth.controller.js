@@ -4,335 +4,410 @@ const gmailConfig = require('../config/gmail.config');
 const logger = require('../utils/logger');
 const { successResponse, errorResponse, unauthorizedResponse } = require('../utils/response');
 const { asyncHandler } = require('../middleware/error.middleware');
-const User = require('../models/user.model');
+const User = require('../models/User.model.js'); // Ensure .js extension and correct casing
 
+/**
+ * @file Authentication Controller
+ * @module controllers/auth
+ * @requires jsonwebtoken
+ * @requires crypto
+ * @requires ../config/gmail.config
+ * @requires ../utils/logger
+ * @requires ../utils/response
+ * @requires ../middleware/error.middleware
+ * @requires ../models/user.model
+ */
+
+/**
+ * Controller for handling user authentication, including OAuth with Gmail.
+ * @class AuthController
+ */
 class AuthController {
   /**
-   * Initiate Gmail OAuth flow
-   * @route GET /auth/gmail
+   * Initiates the Gmail OAuth 2.0 authentication flow.
+   * Generates an authorization URL and returns it to the client.
+   * @method initiateGmailAuth
+   * @route GET /api/v1/auth/gmail
+   * @access Public
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with the Gmail authorization URL and state.
    */
   initiateGmailAuth = asyncHandler(async (req, res) => {
     try {
-      // Generate state parameter for CSRF protection
+      // Generate a secure random state string for CSRF protection
       const state = crypto.randomBytes(32).toString('hex');
       
-      // Store state in session or cache (for now, we'll include it in the URL)
-      // In production, you should store this in Redis or session store
+      // In a stateful application, `state` would be stored in the user's session (e.g., Redis)
+      // to be verified in the callback. For stateless APIs, other mechanisms might be used or
+      // the state might be encoded with information and signed.
       
-      const authUrl = gmailConfig.generateAuthUrl(state);
+      const authUrl = gmailConfig.generateAuthUrl(state); // Pass state to generateAuthUrl
       
-      logger.info('Gmail OAuth flow initiated', {
+      logger.info('Gmail OAuth flow initiated by user.', {
         ip: req.ip,
         userAgent: req.get('User-Agent'),
-        state: state.substring(0, 8) + '...', // Log partial state
+        // Avoid logging the full state if it's sensitive or used for session linking directly.
+        // statePreview: state.substring(0, 8) + '...',
       });
 
+      // Client should store this state (e.g., in localStorage) and send it back during callback for verification.
       return successResponse(res, {
-        authUrl,
-        state, // Client should store this and verify in callback
-        scopes: gmailConfig.getScopeDescriptions(),
-      }, 'Gmail authorization URL generated successfully');
+        authorizationUrl: authUrl,
+        state: state, // Provide state to client for verification on callback
+        requiredScopes: gmailConfig.getScopeDescriptions(), // Inform client about requested permissions
+      }, 'Gmail authorization URL generated. Please redirect user.');
       
     } catch (error) {
-      logger.error('Failed to initiate Gmail auth:', error);
-      return errorResponse(res, 'Failed to initiate Gmail authentication', 500);
+      logger.error('Failed to initiate Gmail authentication flow:', { message: error.message, stack: error.stack });
+      return errorResponse(res, 'Failed to initiate Gmail authentication. Please try again later.', 500);
     }
   });
 
   /**
-   * Handle Gmail OAuth callback
-   * @route GET /auth/gmail/callback
+   * Handles the callback from Gmail OAuth 2.0 flow.
+   * Exchanges the authorization code for tokens, retrieves user info,
+   * finds or creates a user in the database, and issues a JWT.
+   * @method handleGmailCallback
+   * @route GET /api/v1/auth/gmail/callback
+   * @access Public
+   * @param {import('express').Request} req - Express request object. Expects `code` and `state` in query parameters.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with user details and JWT, or an error.
    */
   handleGmailCallback = asyncHandler(async (req, res) => {
     try {
-      const { code, state, error, error_description } = req.query;
+      const { code, state, error: oauthError, error_description: oauthErrorDescription } = req.query;
 
-      // Handle OAuth errors
-      if (error) {
-        logger.warn('Gmail OAuth error:', { error, error_description });
-        return errorResponse(res, `Gmail authentication failed: ${error_description || error}`, 400);
+      // Handle OAuth errors reported by Google
+      if (oauthError) {
+        logger.warn('Gmail OAuth callback error reported by Google:', { oauthError, oauthErrorDescription, ip: req.ip });
+        return errorResponse(res, `Gmail authentication failed: ${oauthErrorDescription || oauthError}`, 400);
       }
 
-      // Validate required parameters
+      // Validate state parameter (compare with the one stored in session or sent by client)
+      // This is crucial for CSRF protection. Example:
+      // if (!state || state !== req.session.oauthState) {
+      //   logger.warn('Invalid OAuth state parameter.', { receivedState: state });
+      //   return errorResponse(res, 'Invalid state parameter. Possible CSRF attempt.', 403);
+      // }
+      // delete req.session.oauthState; // Clean up state from session
+
       if (!code) {
-        return errorResponse(res, 'Authorization code is missing', 400);
+        return errorResponse(res, 'Authorization code is missing in callback.', 400);
       }
 
-      // TODO: Validate state parameter against stored value
-      // For now, we'll just log it
-      logger.info('Gmail OAuth callback received', {
-        hasCode: !!code,
-        hasState: !!state,
-        ip: req.ip,
-      });
+      logger.info('Gmail OAuth callback received successfully.', { hasCode: !!code, hasState: !!state, ip: req.ip });
 
-      // Exchange code for tokens
       const tokens = await gmailConfig.exchangeCodeForTokens(code);
-      
-      if (!tokens.access_token || !tokens.refresh_token) {
-        return errorResponse(res, 'Failed to obtain required tokens from Gmail', 400);
+      if (!tokens.access_token) { // Refresh token might not always be present on subsequent auths
+        logger.error('Failed to obtain access token from Gmail.', { tokensReceived: Object.keys(tokens) });
+        return errorResponse(res, 'Failed to obtain access token from Gmail.', 400);
+      }
+      if (!tokens.refresh_token) {
+        logger.warn('Refresh token not received in this OAuth exchange. This is expected if user has previously authorized this app with offline access.');
       }
 
-      // Get user information from Google
-      const userInfo = await gmailConfig.getUserInfo(tokens.access_token);
-      
-      if (!userInfo.verified_email) {
-        return errorResponse(res, 'Gmail account email is not verified', 400);
+
+      const googleUserInfo = await gmailConfig.getUserInfo(tokens.access_token);
+      if (!googleUserInfo.verified_email) {
+        return errorResponse(res, 'Gmail account email is not verified. Please verify your email with Google.', 400);
       }
 
-      // Find or create user
-      let user = await User.findByEmail(userInfo.email);
+      let user = await User.findByEmail(googleUserInfo.email);
+      const isNewUser = !user;
       
-      if (!user) {
-        // Create new user
+      if (isNewUser) {
         user = new User({
-          email: userInfo.email,
-          name: userInfo.name,
-          avatar: userInfo.avatar,
-          isEmailVerified: true,
+          email: googleUserInfo.email,
+          name: googleUserInfo.name || 'User', // Default name if not provided
+          avatar: googleUserInfo.avatar,
+          isEmailVerified: true, // Email is verified by Google
         });
       }
 
-      // Add or update Gmail provider
       const providerData = {
         provider: 'google',
-        providerId: userInfo.id,
-        email: userInfo.email,
+        providerId: googleUserInfo.id,
+        email: googleUserInfo.email, // Store the email associated with this specific provider login
         accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token,
-        tokenExpiry: new Date(Date.now() + (tokens.expires_in * 1000)),
-        scopes: gmailConfig.scopes,
+        // Only update refresh token if a new one is provided by Google
+        ...(tokens.refresh_token && { refreshToken: tokens.refresh_token }),
+        tokenExpiry: new Date(tokens.expiry_date), // expiry_date is typically a timestamp in ms
+        scopes: tokens.scope ? tokens.scope.split(' ') : gmailConfig.scopes, // Use scopes from token if available
         isActive: true,
-        connectedAt: new Date(),
+        connectedAt: user.providers?.find(p=>p.provider==='google')?.connectedAt || new Date(), // Preserve original connection date if updating
       };
 
-      await user.addProvider(providerData);
-      await user.updateLastLogin();
+      await user.addProvider(providerData); // This method handles both add and update
+      await user.updateLastLogin(); // Update last login timestamp
 
-      // Generate JWT token
       const jwtToken = this.generateJWTToken(user);
+      const jwtExpiresInMs = (parseInt(process.env.JWT_EXPIRES_IN_SECONDS, 10) || 7 * 24 * 60 * 60) * 1000;
 
-      logger.info('Gmail authentication successful', {
-        userId: user._id,
-        email: user.email,
-        isNewUser: !user.createdAt || user.createdAt.getTime() === user.updatedAt.getTime(),
-      });
 
+      logger.info(`Gmail authentication successful for user: ${user.email}`, { userId: user._id, isNewUser });
       return successResponse(res, {
-        user: user.toJSON(),
+        user: user.toJSON(), // Ensure toJSON() is properly configured in User model
         token: jwtToken,
-        tokenExpiry: new Date(Date.now() + (7 * 24 * 60 * 60 * 1000)), // 7 days
-        scopes: gmailConfig.scopes,
-      }, 'Gmail authentication successful');
+        tokenExpiresAt: new Date(Date.now() + jwtExpiresInMs).toISOString(),
+        // grantedScopes: providerData.scopes, // Optionally inform client of granted scopes
+      }, 'Gmail authentication successful. User session established.');
 
     } catch (error) {
-      logger.error('Gmail callback error:', error);
-      return errorResponse(res, 'Gmail authentication failed', 500);
+      logger.error('Error during Gmail OAuth callback handling:', { message: error.message, stack: error.stack });
+      return errorResponse(res, 'Gmail authentication process failed due to an internal error.', 500);
     }
   });
 
   /**
-   * Get current user information
-   * @route GET /auth/me
+   * Retrieves information about the currently authenticated user.
+   * @method getCurrentUser
+   * @route GET /api/v1/auth/me
+   * @access Private (Requires authentication via JWT)
+   * @param {import('express').Request} req - Express request object, expects `req.user` to be populated by `authenticate` middleware.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with the current user's details.
    */
   getCurrentUser = asyncHandler(async (req, res) => {
     try {
+      // req.user.id is populated by the 'authenticate' middleware
       const user = await User.findById(req.user.id);
       
       if (!user || !user.isActive) {
-        return unauthorizedResponse(res, 'User not found or inactive');
+        return unauthorizedResponse(res, 'User not found, inactive, or token invalid.');
       }
 
-      // Update last login time
-      await user.updateLastLogin();
+      await user.updateLastLogin(); // Update last login time, non-critical if it fails
 
       return successResponse(res, {
-        user: user.toJSON(),
-        gmailConnected: !!user.gmailProvider,
-        providers: user.providers.map(p => ({
-          provider: p.provider,
-          email: p.email,
-          isActive: p.isActive,
-          connectedAt: p.connectedAt,
-          lastSyncAt: p.lastSyncAt,
-        })),
-      }, 'User information retrieved successfully');
+        user: user.toJSON(), // Ensure sensitive data is stripped by toJSON in model
+        // Provide a summary of connected providers for the client
+        activeProviders: user.providers
+          .filter(p => p.isActive)
+          .map(p => ({
+            provider: p.provider,
+            email: p.email,
+            connectedAt: p.connectedAt,
+            lastSyncAt: p.lastSyncAt,
+            isTokenExpired: user.isTokenExpired(p.provider, p.providerId) // Add token status
+          })),
+      }, 'Current user information retrieved successfully.');
 
     } catch (error) {
-      logger.error('Get current user error:', error);
-      return errorResponse(res, 'Failed to retrieve user information', 500);
+      logger.error('Error retrieving current user:', { message: error.message, userId: req.user?.id });
+      return errorResponse(res, 'Failed to retrieve user information.', 500);
     }
   });
 
   /**
-   * Refresh Gmail access token
-   * @route POST /auth/gmail/refresh
+   * Refreshes the Gmail access token for the authenticated user.
+   * @method refreshGmailToken
+   * @route POST /api/v1/auth/gmail/refresh
+   * @access Private
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response indicating success or failure of token refresh.
    */
   refreshGmailToken = asyncHandler(async (req, res) => {
     try {
       const user = await User.findById(req.user.id);
-      
-      if (!user) {
-        return unauthorizedResponse(res, 'User not found');
-      }
+      if (!user) return unauthorizedResponse(res, 'User not found.');
 
-      const gmailProvider = user.gmailProvider;
-      
+      const gmailProvider = user.getActiveProvider('google'); // Use method to get active Google provider
       if (!gmailProvider) {
-        return errorResponse(res, 'Gmail account not connected', 400);
+        return errorResponse(res, 'No active Gmail account connected for this user.', 400);
+      }
+      if (!gmailProvider.refreshToken) {
+         return errorResponse(res, 'Refresh token not available. User may need to re-authenticate.', 400);
       }
 
-      // Check if token refresh is needed
-      if (!user.isTokenExpired('google', gmailProvider.providerId)) {
-        return successResponse(res, {
-          message: 'Token is still valid',
-          expiresAt: gmailProvider.tokenExpiry,
-        }, 'Gmail token is still valid');
-      }
+      // Even if not strictly expired by our check, attempt refresh if requested by client.
+      // Or, only refresh if isTokenExpired is true:
+      // if (!user.isTokenExpired('google', gmailProvider.providerId)) {
+      //   return successResponse(res, { message: 'Token is still valid.', expiresAt: gmailProvider.tokenExpiry }, 'Gmail token is still valid.');
+      // }
 
-      // Refresh the token
       const newTokens = await gmailConfig.refreshAccessToken(gmailProvider.refreshToken);
+      if (!newTokens.access_token) {
+        logger.error('Refresh token did not return a new access token.', { userId: user._id });
+        return errorResponse(res, 'Failed to obtain new access token during refresh.', 500);
+      }
       
-      // Update user with new tokens
       await user.updateProviderTokens('google', gmailProvider.providerId, newTokens);
 
-      logger.info('Gmail token refreshed successfully', {
-        userId: user._id,
-        email: user.email,
-      });
-
+      logger.info('Gmail access token refreshed successfully.', { userId: user._id });
       return successResponse(res, {
-        tokenExpiry: new Date(Date.now() + (newTokens.expires_in * 1000)),
-        refreshedAt: new Date(),
-      }, 'Gmail token refreshed successfully');
+        message: 'Gmail token refreshed successfully.',
+        newExpiry: new Date(newTokens.expiry_date).toISOString(), // expiry_date is a timestamp from google-auth-library
+      }, 'Gmail token refreshed successfully.');
 
     } catch (error) {
-      logger.error('Gmail token refresh error:', error);
-      return errorResponse(res, 'Failed to refresh Gmail token', 500);
+      logger.error('Gmail token refresh process failed:', { message: error.message, userId: req.user?.id });
+      // If refresh token is invalid (e.g., revoked by user), they need to re-authenticate.
+      if (error.message.toLowerCase().includes('token has been expired or revoked')) {
+         return errorResponse(res, 'Gmail refresh token is invalid. Please re-authenticate your Gmail account.', 401);
+      }
+      return errorResponse(res, 'Failed to refresh Gmail token.', 500);
     }
   });
 
   /**
-   * Disconnect Gmail account
-   * @route DELETE /auth/gmail/disconnect
+   * Disconnects the user's Gmail account by revoking tokens and removing provider data.
+   * @method disconnectGmail
+   * @route DELETE /api/v1/auth/gmail/disconnect
+   * @access Private
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response indicating success or failure.
    */
   disconnectGmail = asyncHandler(async (req, res) => {
     try {
       const user = await User.findById(req.user.id);
-      
-      if (!user) {
-        return unauthorizedResponse(res, 'User not found');
-      }
+      if (!user) return unauthorizedResponse(res, 'User not found.');
 
-      const gmailProvider = user.gmailProvider;
-      
+      const gmailProvider = user.getActiveProvider('google');
       if (!gmailProvider) {
-        return errorResponse(res, 'Gmail account not connected', 400);
+        return errorResponse(res, 'No active Gmail account is connected to disconnect.', 400);
       }
 
-      // Revoke tokens with Google
+      // Attempt to revoke tokens with Google. This is best-effort.
       try {
-        await gmailConfig.revokeTokens(gmailProvider.accessToken);
-      } catch (error) {
-        logger.warn('Failed to revoke tokens with Google:', error.message);
-        // Continue with local cleanup even if revocation fails
+        if (gmailProvider.accessToken) { // Some flows might not store accessToken if only refreshToken is used.
+          await gmailConfig.revokeTokens(gmailProvider.accessToken); // Use accessToken for revocation
+        } else if (gmailProvider.refreshToken) {
+          // If only refresh token is available, some providers might allow revoking it directly
+          // For Google, revoking an access token usually revokes the associated refresh token if from same grant.
+          // If only refresh token is stored, direct revocation might be different or not supported via simple API.
+          // As a fallback, we'll just remove it locally if access token is missing.
+           logger.warn('Access token not available for revocation, attempting with refresh token or local removal only.', { userId: user._id });
+           await gmailConfig.revokeTokens(gmailProvider.refreshToken); // Try with refresh token
+        }
+      } catch (revocationError) {
+        logger.warn('Failed to revoke tokens with Google during disconnect. This might happen if tokens were already invalid.', {
+          userId: user._id,
+          errorMessage: revocationError.message,
+        });
+        // Proceed with local cleanup regardless of Google revocation status.
       }
 
-      // Remove provider from user
       await user.removeProvider('google', gmailProvider.providerId);
 
-      logger.info('Gmail account disconnected', {
-        userId: user._id,
-        email: user.email,
-      });
-
-      return successResponse(res, null, 'Gmail account disconnected successfully');
+      logger.info('Gmail account disconnected successfully.', { userId: user._id });
+      return successResponse(res, null, 'Gmail account disconnected successfully.');
 
     } catch (error) {
-      logger.error('Gmail disconnect error:', error);
-      return errorResponse(res, 'Failed to disconnect Gmail account', 500);
+      logger.error('Gmail disconnect process failed:', { message: error.message, userId: req.user?.id });
+      return errorResponse(res, 'Failed to disconnect Gmail account.', 500);
     }
   });
 
   /**
-   * Get connection status for all providers
-   * @route GET /auth/connections
+   * Retrieves the connection status for all OAuth providers linked to the user.
+   * @method getConnections
+   * @route GET /api/v1/auth/connections
+   * @access Private
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with connection statuses.
    */
   getConnections = asyncHandler(async (req, res) => {
     try {
       const user = await User.findById(req.user.id);
-      
-      if (!user) {
-        return unauthorizedResponse(res, 'User not found');
-      }
+      if (!user) return unauthorizedResponse(res, 'User not found.');
 
-      const connections = {
-        gmail: {
-          connected: !!user.gmailProvider,
-          email: user.gmailProvider?.email || null,
-          connectedAt: user.gmailProvider?.connectedAt || null,
-          lastSyncAt: user.gmailProvider?.lastSyncAt || null,
-          tokenExpired: user.gmailProvider ? user.isTokenExpired('google', user.gmailProvider.providerId) : null,
-        },
-        // Add other providers here in the future
-      };
+      const connections = user.providers.map(p => ({
+        provider: p.provider,
+        email: p.email,
+        isConnected: p.isActive,
+        connectedAt: p.connectedAt,
+        lastSyncAt: p.lastSyncAt,
+        isTokenExpired: user.isTokenExpired(p.provider, p.providerId),
+        scopesGranted: p.scopes,
+      }));
+      // Example for a specific provider if needed directly
+      // const gmailProvider = user.getActiveProvider('google');
+      // const gmailStatus = { ... };
 
-      return successResponse(res, connections, 'Connection status retrieved successfully');
+      return successResponse(res, { connections }, 'Connection statuses retrieved successfully.');
 
     } catch (error) {
-      logger.error('Get connections error:', error);
-      return errorResponse(res, 'Failed to retrieve connection status', 500);
+      logger.error('Error retrieving connection statuses:', { message: error.message, userId: req.user?.id });
+      return errorResponse(res, 'Failed to retrieve connection statuses.', 500);
     }
   });
 
   /**
-   * Logout user
-   * @route POST /auth/logout
+   * Logs out the user.
+   * For JWT-based auth, this is typically a client-side operation (deleting the token).
+   * Server-side might involve token blacklisting if implemented.
+   * @method logout
+   * @route POST /api/v1/auth/logout
+   * @access Private
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response indicating successful logout.
    */
   logout = asyncHandler(async (req, res) => {
     try {
-      // For now, we'll just return success since JWT is stateless
-      // In a more advanced implementation, you might want to:
-      // 1. Blacklist the JWT token
-      // 2. Clear any cached user data
-      // 3. Log the logout event
+      // If using a token blacklist (e.g., with Redis), add the current token to it here.
+      // Example: await TokenBlacklistService.add(req.token);
+      // For simple JWT, logout is mainly a client-side responsibility.
 
-      logger.info('User logged out', {
-        userId: req.user.id,
-        email: req.user.email,
-      });
-
-      return successResponse(res, null, 'Logged out successfully');
+      logger.info('User logout request processed.', { userId: req.user.id });
+      return successResponse(res, null, 'Logout successful. Please clear your local token.');
 
     } catch (error) {
-      logger.error('Logout error:', error);
-      return errorResponse(res, 'Logout failed', 500);
+      logger.error('Logout process error:', { message: error.message, userId: req.user?.id });
+      return errorResponse(res, 'Logout failed due to an internal error.', 500);
     }
   });
 
   /**
-   * Generate JWT token for user
+   * Generates a JWT (JSON Web Token) for a given user.
+   * The token includes user's ID, email, and name.
+   * @method generateJWTToken
+   * @private
+   * @param {User} user - The user object for whom to generate the token.
+   * @returns {string} The generated JWT.
    */
   generateJWTToken(user) {
     const payload = {
-      id: user._id,
+      id: user._id.toString(), // Ensure ID is a string
       email: user.email,
       name: user.name,
+      // role: user.role, // Optionally include role or other non-sensitive data
     };
+    const secret = process.env.JWT_SECRET;
+    const expiresIn = process.env.JWT_EXPIRES_IN_SECONDS ? `${process.env.JWT_EXPIRES_IN_SECONDS}s` : '7d';
 
-    return jwt.sign(payload, process.env.JWT_SECRET, {
-      expiresIn: process.env.JWT_EXPIRES_IN || '7d',
-    });
+    if (!secret) {
+      logger.error('JWT_SECRET is not defined. Cannot sign tokens.');
+      throw new Error('JWT signing error due to missing secret.');
+    }
+
+    return jwt.sign(payload, secret, { expiresIn });
   }
 
   /**
-   * Verify JWT token
+   * Verifies a JWT. (Primarily for internal use or testing, auth middleware handles verification for routes)
+   * @method verifyJWTToken
+   * @private
+   * @param {string} token - The JWT to verify.
+   * @returns {object} The decoded token payload if verification is successful.
+   * @throws {Error} If the token is invalid or expired.
    */
   verifyJWTToken(token) {
     try {
-      return jwt.verify(token, process.env.JWT_SECRET);
+      const secret = process.env.JWT_SECRET;
+      if (!secret) {
+        logger.error('JWT_SECRET is not defined. Cannot verify tokens.');
+        throw new Error('JWT verification error due to missing secret.');
+      }
+      return jwt.verify(token, secret);
     } catch (error) {
-      throw new Error('Invalid or expired token');
+      logger.warn('JWT verification failed:', { tokenProvided: !!token, errorMessage: error.message });
+      throw new Error(`Token verification failed: ${error.message}`);
     }
   }
 }

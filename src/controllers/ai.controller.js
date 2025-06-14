@@ -3,379 +3,364 @@ const logger = require('../utils/logger');
 const { successResponse, errorResponse, validationErrorResponse } = require('../utils/response');
 const { asyncHandler } = require('../middleware/error.middleware');
 const aiConfig = require('../config/ai.config');
-const User = require('../models/user.model');
+const User = require('../models/User.model.js'); // Ensure .js extension and correct casing
 
+/**
+ * @file AI Controller
+ * @module controllers/ai
+ * @requires ../services/ai.service
+ * @requires ../utils/logger
+ * @requires ../utils/response
+ * @requires ../middleware/error.middleware
+ * @requires ../config/ai.config
+ * @requires ../models/user.model
+ */
+
+/**
+ * Controller for AI-related operations.
+ * Handles requests for health checks, email summarization, daily summaries,
+ * question answering, service info, testing, and usage statistics.
+ * All methods are wrapped with `asyncHandler` for error handling.
+ * @class AIController
+ */
 class AIController {
   /**
-   * Test AI service connectivity and capabilities
-   * @route GET /ai/health
-   * @access Private
+   * Tests AI service connectivity and capabilities.
+   * @method healthCheck
+   * @route GET /api/v1/ai/health
+   * @access Private (Requires authentication)
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with AI service health status.
    */
   healthCheck = asyncHandler(async (req, res) => {
     try {
       const healthData = await aiService.healthCheck();
       
-      logger.info('AI service health check requested', {
-        userId: req.user?.id,
+      logger.info('AI service health check performed', { // Changed log message for clarity
+        userId: req.user?.id, // Assumes req.user is populated by auth middleware
         provider: healthData.provider,
-        healthy: healthData.healthy,
+        isHealthy: healthData.healthy, // Standardized to isHealthy
       });
 
       if (healthData.healthy) {
-        return successResponse(res, healthData, 'AI service is healthy');
+        return successResponse(res, healthData, 'AI service is healthy and operational.');
       } else {
-        return errorResponse(res, 'AI service is unhealthy', 503, healthData);
+        // Use a more specific status code if the service is unhealthy (e.g., 503 Service Unavailable)
+        return errorResponse(res, 'AI service is currently unhealthy or unavailable.', 503, healthData);
       }
     } catch (error) {
-      logger.error('AI health check failed:', error);
-      return errorResponse(res, 'AI health check failed', 500);
+      logger.error('AI health check controller failed:', { message: error.message, stack: error.stack });
+      return errorResponse(res, 'An error occurred during the AI health check.', 500);
     }
   });
 
   /**
-   * Generate summary for a single email
-   * @route POST /ai/summarize-email
+   * Generates a summary for a single email provided in the request body.
+   * @method summarizeEmail
+   * @route POST /api/v1/ai/summarize-email
    * @access Private
+   * @param {import('express').Request} req - Express request object. Expects `req.body` to contain `subject`, `body`, `sender`, `receivedAt`, `snippet`.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with the generated email summary.
    */
   summarizeEmail = asyncHandler(async (req, res) => {
     try {
       const { subject, body, sender, receivedAt, snippet } = req.body;
 
-      // Validate required fields
+      // Basic validation for essential email content
       if (!subject && !body && !snippet) {
-        return validationErrorResponse(res, [
-          { field: 'content', message: 'Email subject, body, or snippet is required' }
-        ]);
+        return validationErrorResponse(res, [{ field: 'emailContent', message: 'Email subject, body, or snippet is required to generate a summary.' }]);
       }
 
-      // Get user persona if available
-      const user = await User.findById(req.user.id).populate('persona');
-      const persona = user.persona || null;
+      // Fetch user and their persona (if exists) to tailor the summary
+      const user = await User.findById(req.user.id).populate('persona'); // Populate persona details
+      const persona = user?.persona || null; // Use null if no persona
 
-      // Prepare email data
       const emailData = {
-        subject: subject || 'No subject',
-        body: body || snippet || '',
-        sender: sender || 'Unknown sender',
-        receivedAt: receivedAt || new Date(),
+        subject: subject || 'No Subject Provided',
+        body: body || snippet || '', // Ensure body is not undefined
+        sender: sender || 'Unknown Sender',
+        receivedAt: receivedAt ? new Date(receivedAt) : new Date(), // Ensure valid date
         snippet: snippet || '',
       };
 
-      // Generate summary
       const summary = await aiService.generateEmailSummary(emailData, persona, 'individual');
 
-      // Track usage
-      await user.incrementUsage('emailsProcessed');
+      // Increment usage counter for the user
+      if (user) { // Ensure user object exists
+        await user.incrementUsage('emailsProcessed');
+        await user.incrementUsage('apiCallsThisMonth'); // Also count as a general API call
+      }
 
-      logger.info('Email summary generated', {
+      logger.info('Single email summary generated successfully', {
         userId: req.user.id,
-        subject: subject?.substring(0, 50),
+        emailSubjectPreview: emailData.subject.substring(0, 50), // Log a preview
         summaryLength: summary.content?.length || 0,
-        actionItems: summary.actionItems?.length || 0,
       });
 
       return successResponse(res, {
         summary,
-        emailData: {
-          subject: emailData.subject,
-          sender: emailData.sender,
-          receivedAt: emailData.receivedAt,
-        },
-        generatedAt: new Date(),
-      }, 'Email summary generated successfully');
+        originalEmail: { subject: emailData.subject, sender: emailData.sender }, // Provide some context
+        generatedAt: new Date().toISOString(),
+      }, 'Email summary generated successfully.');
 
     } catch (error) {
-      logger.error('Email summarization failed:', error);
-      
-      if (error.message.includes('rate limit')) {
+      logger.error('Email summarization controller failed:', { message: error.message, userId: req.user?.id });
+      if (error.message.toLowerCase().includes('rate limit')) {
         return errorResponse(res, 'AI service rate limit exceeded. Please try again later.', 429);
-      } else if (error.message.includes('authentication')) {
-        return errorResponse(res, 'AI service configuration error', 500);
+      } else if (error.message.toLowerCase().includes('authentication') || error.message.toLowerCase().includes('api key')) {
+        return errorResponse(res, 'AI service configuration error. Please contact support.', 500);
       }
-      
-      return errorResponse(res, 'Failed to generate email summary', 500);
+      return errorResponse(res, 'Failed to generate email summary due to an internal error.', 500);
     }
   });
 
   /**
-   * Generate daily summary from multiple email summaries
-   * @route POST /ai/daily-summary
+   * Generates a daily summary from an array of individual email summaries.
+   * @method generateDailySummary
+   * @route POST /api/v1/ai/daily-summary
    * @access Private
+   * @param {import('express').Request} req - Express request object. Expects `req.body` to contain `summaries` (array) and optional `date`.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with the generated daily summary.
    */
   generateDailySummary = asyncHandler(async (req, res) => {
     try {
-      const { summaries, date } = req.body;
+      const { summaries, date } = req.body; // `summaries` is expected to be an array of pre-summarized email objects or full email data
 
-      // Validate input
       if (!Array.isArray(summaries) || summaries.length === 0) {
-        return validationErrorResponse(res, [
-          { field: 'summaries', message: 'Array of email summaries is required' }
-        ]);
+        return validationErrorResponse(res, [{ field: 'summaries', message: 'An array of email summaries or details is required.' }]);
       }
 
-      // Get user persona
       const user = await User.findById(req.user.id).populate('persona');
-      const persona = user.persona || null;
+      const persona = user?.persona || null;
 
-      // Generate daily summary
       const dailySummary = await aiService.generateDailySummary(summaries, persona);
 
-      // Add date information
-      dailySummary.date = date || new Date().toISOString().split('T')[0];
-      dailySummary.generatedAt = new Date();
+      // Enhance daily summary object
+      dailySummary.date = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+      dailySummary.generatedAt = new Date().toISOString();
+      dailySummary.sourceEmailCount = summaries.length;
 
-      // Track usage
-      await user.incrementUsage('summariesGenerated');
+      if (user) {
+        await user.incrementUsage('summariesGenerated');
+        await user.incrementUsage('apiCallsThisMonth');
+      }
 
-      logger.info('Daily summary generated', {
+      logger.info('Daily summary generated successfully', {
         userId: req.user.id,
         emailCount: summaries.length,
-        summaryLength: dailySummary.content?.length || 0,
-        actionItems: dailySummary.actionItems?.length || 0,
+        summaryDate: dailySummary.date,
       });
 
-      return successResponse(res, {
-        dailySummary,
-        processedEmails: summaries.length,
-        date: dailySummary.date,
-      }, 'Daily summary generated successfully');
+      return successResponse(res, { dailySummary }, 'Daily summary generated successfully.');
 
     } catch (error) {
-      logger.error('Daily summary generation failed:', error);
-      
-      if (error.message.includes('rate limit')) {
+      logger.error('Daily summary generation controller failed:', { message: error.message, userId: req.user?.id });
+      if (error.message.toLowerCase().includes('rate limit')) {
         return errorResponse(res, 'AI service rate limit exceeded. Please try again later.', 429);
       }
-      
-      return errorResponse(res, 'Failed to generate daily summary', 500);
+      return errorResponse(res, 'Failed to generate daily summary due to an internal error.', 500);
     }
   });
 
   /**
-   * Answer questions about emails using AI
-   * @route POST /ai/ask
+   * Answers a user's question based on provided email context.
+   * @method askQuestion
+   * @route POST /api/v1/ai/ask
    * @access Private
+   * @param {import('express').Request} req - Express request object. Expects `req.body` to contain `question` and `emailContext` (array).
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with the AI-generated answer.
    */
   askQuestion = asyncHandler(async (req, res) => {
     try {
       const { question, emailContext } = req.body;
 
-      // Validate input
-      if (!question || typeof question !== 'string') {
-        return validationErrorResponse(res, [
-          { field: 'question', message: 'Question is required and must be a string' }
-        ]);
+      if (!question || typeof question !== 'string' || question.trim() === '') {
+        return validationErrorResponse(res, [{ field: 'question', message: 'A non-empty question is required.' }]);
+      }
+      if (!Array.isArray(emailContext)) { // Could add more validation for context items
+        return validationErrorResponse(res, [{ field: 'emailContext', message: 'Email context must be an array.' }]);
       }
 
-      if (!Array.isArray(emailContext)) {
-        return validationErrorResponse(res, [
-          { field: 'emailContext', message: 'Email context must be an array' }
-        ]);
-      }
-
-      // Get user persona
       const user = await User.findById(req.user.id).populate('persona');
-      const persona = user.persona || null;
+      const persona = user?.persona || null;
 
-      // Generate answer
       const answer = await aiService.answerEmailQuestion(question, emailContext, persona);
 
-      // Track usage
-      await user.incrementUsage('apiCallsThisMonth');
+      if (user) {
+        await user.incrementUsage('apiCallsThisMonth'); // Consider a specific counter for Q&A if needed
+      }
 
-      logger.info('Email question answered', {
+      logger.info('AI question answered successfully', {
         userId: req.user.id,
-        question: question.substring(0, 100),
-        contextCount: emailContext.length,
-        answerLength: answer.length,
+        questionPreview: question.substring(0, 100),
       });
 
       return successResponse(res, {
         question,
         answer,
-        contextCount: emailContext.length,
-        answeredAt: new Date(),
-      }, 'Question answered successfully');
+        contextItemsProvided: emailContext.length,
+        answeredAt: new Date().toISOString(),
+      }, 'Question answered successfully.');
 
     } catch (error) {
-      logger.error('Question answering failed:', error);
-      
-      if (error.message.includes('rate limit')) {
+      logger.error('AI question answering controller failed:', { message: error.message, userId: req.user?.id });
+      if (error.message.toLowerCase().includes('rate limit')) {
         return errorResponse(res, 'AI service rate limit exceeded. Please try again later.', 429);
       }
-      
-      return errorResponse(res, 'Failed to answer question', 500);
+      return errorResponse(res, 'Failed to answer question due to an internal error.', 500);
     }
   });
 
   /**
-   * Get AI service information and capabilities
-   * @route GET /ai/info
+   * Retrieves information about the configured AI service, its capabilities, and models.
+   * @method getServiceInfo
+   * @route GET /api/v1/ai/info
    * @access Private
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with AI service information.
    */
   getServiceInfo = asyncHandler(async (req, res) => {
     try {
-      const provider = aiConfig.getCurrentProvider();
+      const currentProviderConfig = aiConfig.getCurrentProvider();
       const capabilities = aiConfig.getProviderCapabilities();
-      const rateLimit = aiConfig.getRateLimit();
-      const availableModels = await aiConfig.getAvailableModels();
+      const rateLimits = aiConfig.getRateLimit();
+      const models = await aiConfig.getAvailableModels(); // This is an async function
 
       const serviceInfo = {
         provider: {
-          name: provider.name,
-          models: provider.models,
-          defaultModel: provider.defaultModel,
-          maxTokens: provider.maxTokens,
+          name: currentProviderConfig.name,
+          configuredModels: currentProviderConfig.models, // Models specifically configured for use cases
+          defaultModel: currentProviderConfig.defaultModel,
+          maxTokensOverall: currentProviderConfig.maxTokens,
         },
-        capabilities,
-        rateLimit,
-        availableModels: availableModels.slice(0, 5), // Limit to first 5 models
-        features: {
+        detailedCapabilities: capabilities,
+        currentRateLimits: rateLimits,
+        availableModelsList: models.map(m => ({ id: m.id, contextWindow: m.contextWindow })).slice(0,10), // Show limited list
+        supportedFeatures: { // Simplified feature list
           emailSummarization: true,
           dailySummaryGeneration: true,
           questionAnswering: true,
-          multiLanguageSupport: capabilities.conversational,
-          streaming: capabilities.streaming,
+          multiLanguageSupport: !!capabilities.conversational,
+          streamingResponses: !!capabilities.streaming,
         },
       };
 
-      logger.info('AI service info requested', {
-        userId: req.user.id,
-        provider: provider.name,
-      });
-
-      return successResponse(res, serviceInfo, 'AI service information retrieved');
+      logger.info('AI service information retrieved', { userId: req.user.id, provider: currentProviderConfig.name });
+      return successResponse(res, serviceInfo, 'AI service information retrieved successfully.');
 
     } catch (error) {
-      logger.error('Failed to get AI service info:', error);
-      return errorResponse(res, 'Failed to retrieve AI service information', 500);
+      logger.error('Failed to get AI service info:', { message: error.message, userId: req.user?.id });
+      return errorResponse(res, 'Failed to retrieve AI service information.', 500);
     }
   });
 
   /**
-   * Test AI service with sample email
-   * @route POST /ai/test
+   * Performs a test of the AI summarization service using a sample email.
+   * @method testService
+   * @route POST /api/v1/ai/test
    * @access Private
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with the test summary or an error.
    */
   testService = asyncHandler(async (req, res) => {
     try {
-      // Sample email for testing
       const sampleEmail = {
-        subject: 'Test Email - Weekly Team Meeting',
-        body: `Hi Team,
-        
-        I hope everyone is doing well. I wanted to remind you about our weekly team meeting scheduled for Thursday at 2 PM.
-        
-        Agenda:
-        1. Project updates from each team member
-        2. Discussion about the new client requirements
-        3. Review of next week's priorities
-        4. Q&A session
-        
-        Please come prepared with your project status updates. If you can't attend, please send your updates via email.
-        
-        Looking forward to seeing everyone there!
-        
-        Best regards,
-        John Manager`,
-        sender: 'john.manager@company.com',
-        receivedAt: new Date(),
+        subject: 'Project Phoenix - Critical Update & Action Required',
+        body: `Hi Team,\n\nFollowing our discussion on the new client feedback for Project Phoenix, we need to implement the revised UI mockups by EOD Wednesday. Resources are available in the shared drive.\n\nKey points:\n- Login page needs two-factor authentication.\n- Dashboard graphs must be interactive.\n- User profile section requires avatar uploads.\n\nPlease confirm your assigned tasks. Let's sync tomorrow at 10 AM for a quick huddle.\n\nBest,\nSarah (Project Lead)`,
+        sender: 'sarah.lead@example.com',
+        receivedAt: new Date(Date.now() - 24 * 60 * 60 * 1000), // Yesterday
       };
 
-      // Generate test summary
-      const summary = await aiService.generateEmailSummary(sampleEmail, null, 'individual');
+      // Fetch user persona to make the test more realistic, if available
+      const user = await User.findById(req.user.id).populate('persona');
+      const persona = user?.persona || null;
 
-      logger.info('AI service test completed', {
-        userId: req.user.id,
-        success: true,
-      });
+      const summary = await aiService.generateEmailSummary(sampleEmail, persona, 'individual');
 
+      logger.info('AI service test summarization completed successfully', { userId: req.user.id });
       return successResponse(res, {
-        testEmail: {
-          subject: sampleEmail.subject,
-          sender: sampleEmail.sender,
-        },
-        generatedSummary: summary,
-        testStatus: 'success',
-        testedAt: new Date(),
-      }, 'AI service test completed successfully');
+        testEmailDetails: { subject: sampleEmail.subject, sender: sampleEmail.sender },
+        generatedTestSummary: summary,
+        status: 'success',
+        timestamp: new Date().toISOString(),
+      }, 'AI service test completed successfully.');
 
     } catch (error) {
-      logger.error('AI service test failed:', error);
-      
-      return errorResponse(res, {
-        testStatus: 'failed',
-        error: error.message,
-        testedAt: new Date(),
-      }, 'AI service test failed', 500);
+      logger.error('AI service test controller failed:', { message: error.message, userId: req.user?.id });
+      return errorResponse(res,
+        { status: 'failed', errorDetails: error.message, timestamp: new Date().toISOString() },
+        'AI service test failed.',
+        500
+      );
     }
   });
 
   /**
-   * Get usage statistics for AI service
-   * @route GET /ai/usage
+   * Retrieves AI service usage statistics for the authenticated user.
+   * @method getUsageStats
+   * @route GET /api/v1/ai/usage
    * @access Private
+   * @param {import('express').Request} req - Express request object.
+   * @param {import('express').Response} res - Express response object.
+   * @returns {Promise<void>} Sends a JSON response with user's AI usage statistics.
    */
   getUsageStats = asyncHandler(async (req, res) => {
     try {
       const user = await User.findById(req.user.id);
+      if (!user) { // Should not happen if auth middleware is effective
+        return errorResponse(res, 'User not found.', 404);
+      }
       
+      const planLimits = this.getUsageLimits(user.subscription.plan);
+      const currentUsage = user.usage || {}; // Ensure usage object exists
+
       const usageStats = {
-        currentMonth: {
-          emailsProcessed: user.usage.emailsProcessed || 0,
-          summariesGenerated: user.usage.summariesGenerated || 0,
-          apiCalls: user.usage.apiCallsThisMonth || 0,
+        currentCycleUsage: {
+          emailsProcessed: currentUsage.emailsProcessed || 0,
+          summariesGenerated: currentUsage.summariesGenerated || 0,
+          apiCalls: currentUsage.apiCallsThisMonth || 0,
         },
-        subscription: {
-          plan: user.subscription.plan,
-          status: user.subscription.status,
-        },
-        limits: this.getUsageLimits(user.subscription.plan),
-        resetDate: user.usage.lastResetAt,
+        subscriptionPlan: user.subscription.plan,
+        cycleLimits: planLimits,
+        cycleResetsAt: user.usage?.lastResetAt ? new Date(user.usage.lastResetAt.setDate(user.usage.lastResetAt.getDate() + 30)).toISOString() : 'N/A', // Approximate next reset
       };
 
-      // Calculate usage percentages
-      const limits = usageStats.limits;
-      usageStats.percentages = {
-        emailsProcessed: limits.emailsProcessed ? 
-          Math.round((usageStats.currentMonth.emailsProcessed / limits.emailsProcessed) * 100) : 0,
-        summariesGenerated: limits.summariesGenerated ? 
-          Math.round((usageStats.currentMonth.summariesGenerated / limits.summariesGenerated) * 100) : 0,
-        apiCalls: limits.apiCalls ? 
-          Math.round((usageStats.currentMonth.apiCalls / limits.apiCalls) * 100) : 0,
+      // Calculate percentages if limits are defined (not null/unlimited)
+      usageStats.usagePercentages = {
+        emailsProcessed: planLimits.emailsProcessed ? Math.min(100, Math.round((usageStats.currentCycleUsage.emailsProcessed / planLimits.emailsProcessed) * 100)) : 'N/A',
+        summariesGenerated: planLimits.summariesGenerated ? Math.min(100, Math.round((usageStats.currentCycleUsage.summariesGenerated / planLimits.summariesGenerated) * 100)) : 'N/A',
+        apiCalls: planLimits.apiCalls ? Math.min(100, Math.round((usageStats.currentCycleUsage.apiCalls / planLimits.apiCalls) * 100)) : 'N/A',
       };
 
-      return successResponse(res, usageStats, 'Usage statistics retrieved');
+      return successResponse(res, usageStats, 'Usage statistics retrieved successfully.');
 
     } catch (error) {
-      logger.error('Failed to get usage stats:', error);
-      return errorResponse(res, 'Failed to retrieve usage statistics', 500);
+      logger.error('Failed to get usage stats:', { message: error.message, userId: req.user?.id });
+      return errorResponse(res, 'Failed to retrieve usage statistics.', 500);
     }
   });
 
   /**
-   * Get usage limits based on subscription plan
+   * Helper method to get usage limits based on subscription plan.
+   * This could be moved to a subscription service or config if it grows complex.
+   * @private
+   * @param {string} plan - The user's subscription plan (e.g., 'free', 'pro').
+   * @returns {object} Object containing limits for emailsProcessed, summariesGenerated, apiCalls.
    */
   getUsageLimits(plan) {
-    const limits = {
-      free: {
-        emailsProcessed: 100,
-        summariesGenerated: 30,
-        apiCalls: 500,
-      },
-      pro: {
-        emailsProcessed: 1000,
-        summariesGenerated: 300,
-        apiCalls: 5000,
-      },
-      enterprise: {
-        emailsProcessed: null, // unlimited
-        summariesGenerated: null, // unlimited
-        apiCalls: null, // unlimited
-      },
+    // These limits should ideally be stored in a configuration file or database
+    const limitsByPlan = {
+      free: { emailsProcessed: 100, summariesGenerated: 30, apiCalls: 500 },
+      pro: { emailsProcessed: 1000, summariesGenerated: 300, apiCalls: 5000 },
+      enterprise: { emailsProcessed: null, summariesGenerated: null, apiCalls: null }, // null indicates unlimited
     };
-
-    return limits[plan] || limits.free;
+    return limitsByPlan[plan] || limitsByPlan.free; // Default to free plan limits if plan is unknown
   }
 }
 

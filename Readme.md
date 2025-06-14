@@ -71,7 +71,8 @@ src/
 
 5. **Verify the installation**
    ```bash
-   curl http://localhost:3000/health
+   curl http://localhost:3000/api/v1/health
+   # Note: Default port is 3000, API_PREFIX is /api/v1 by default. Adjust if you changed them.
    ```
 
 ## Environment Configuration
@@ -82,9 +83,12 @@ src/
 # Server
 NODE_ENV=development
 PORT=3000
+HOST=localhost # Optional: defaults to localhost
+API_PREFIX=/api/v1 # Optional: defaults to /api/v1
 
 # Database
 MONGODB_URI=mongodb://localhost:27017/email_summarizer
+MONGODB_TEST_URI=mongodb://localhost:27017/email_summarizer_test # For running tests
 
 # JWT
 JWT_SECRET=your-super-secret-jwt-key
@@ -98,7 +102,9 @@ GOOGLE_REDIRECT_URI=http://localhost:3000/auth/google/callback
 OPENAI_API_KEY=your-openai-api-key
 # OR
 ANTHROPIC_API_KEY=your-anthropic-api-key
-AI_PROVIDER=openai
+# AI_PROVIDER can be 'groq', 'openai', 'anthropic', 'huggingface'. Defaults to 'groq'.
+AI_PROVIDER=groq
+GROQ_API_KEY=your-groq-api-key # Required if AI_PROVIDER is 'groq'
 ```
 
 ### Optional Configuration
@@ -122,18 +128,21 @@ ALLOWED_ORIGINS=http://localhost:3000
 
 ## API Endpoints
 
-### Health Checks
+All API endpoints are prefixed with `/api/v1` (or your `API_PREFIX` environment variable).
 
-- `GET /health` - Basic health check
-- `GET /health/detailed` - Detailed system health
-- `GET /health/database` - Database connectivity check
-- `GET /health/ready` - Kubernetes readiness probe
-- `GET /health/live` - Kubernetes liveness probe
+- **Root**: `GET /api/v1/` - Provides basic API information and links.
+- **API Documentation**: `GET /api/v1/api-docs` - Offers a list of available modules and their base paths. This should be consulted for detailed endpoint information.
+- **Health Checks**: `GET /api/v1/health/*` - Includes various health check endpoints like:
+    - `GET /api/v1/health` (basic)
+    - `GET /api/v1/health/detailed` (dependencies and system info)
+    - `GET /api/v1/health/ready` (Kubernetes readiness)
+    - `GET /api/v1/health/live` (Kubernetes liveness)
+- **Authentication**: `GET /api/v1/auth/*` - Endpoints for user authentication, including Gmail OAuth.
+- **AI Services**: `POST /api/v1/ai/*` - Endpoints for AI-driven tasks like summarization and Q&A.
+- **Email Management**: `GET /api/v1/emails/*`, `POST /api/v1/emails/*` - Endpoints for email processing, retrieval, and summaries.
+- **Persona Management**: `GET /api/v1/persona/*`, `POST /api/v1/persona/*` - Endpoints for managing user personas.
 
-### Application Info
-
-- `GET /` - API information and available endpoints
-- `GET /api-docs` - API documentation
+For a comprehensive and up-to-date list of all endpoints, please refer to the self-documenting endpoint at `/api/v1/api-docs` once the server is running.
 
 ## Development
 

@@ -1,259 +1,254 @@
 const gmailService = require('./gmail.service');
 const aiService = require('./ai.service');
 const logger = require('../utils/logger');
-const User = require('../models/user.model');
-const Email = require('../models/email.model');
-const Summary = require('../models/summary.model');
+const User = require('../models/User.model.js'); // Ensure .js extension and correct casing
+const Email = require('../models/email.model.js'); // Ensure .js extension
+const Summary = require('../models/summary.model.js'); // Ensure .js extension
 
+/**
+ * @file Email Processing Service
+ * @module services/email-processing
+ * @requires ./gmail.service
+ * @requires ./ai.service
+ * @requires ../utils/logger
+ * @requires ../models/user.model
+ * @requires ../models/email.model
+ * @requires ../models/summary.model
+ */
+
+/**
+ * Service class for orchestrating the email processing workflow.
+ * This includes fetching emails, filtering, generating summaries, and storing data.
+ * @class EmailProcessingService
+ */
 class EmailProcessingService {
+  /**
+   * Initializes the EmailProcessingService.
+   * Sets up an in-memory queue to track processing status for users.
+   * @constructor
+   */
   constructor() {
-    this.processingQueue = new Map(); // Simple in-memory queue
+    /**
+     * @member {Map<string, {startedAt: Date}>} processingQueue
+     * In-memory map to track users whose emails are currently being processed.
+     * Key: userId, Value: { startedAt: Date }
+     * Note: For a scalable solution, a distributed queue (e.g., Redis, RabbitMQ) would be preferable.
+     */
+    this.processingQueue = new Map();
   }
 
   /**
-   * Process daily emails for a user
-   * @param {string} userId - User ID
-   * @param {Object} options - Processing options
+   * Orchestrates the daily processing of emails for a given user.
+   * Fetches emails, filters them based on persona, stores them,
+   * generates individual and daily summaries, and updates user statistics.
+   * @async
+   * @param {string} userId - The ID of the user whose emails are to be processed.
+   * @param {object} [options={}] - Options for email fetching and processing.
+   * @param {Date} [options.after] - Fetch emails received after this date. Defaults to yesterday.
+   * @param {number} [options.maxResults=50] - Maximum number of emails to fetch.
+   * @param {boolean} [options.includeRead=true] - Whether to include read emails.
+   * @param {boolean} [options.excludePromotions=true] - Whether to exclude promotion category emails.
+   * @param {boolean} [options.excludeSocial=true] - Whether to exclude social category emails.
+   * @returns {Promise<object>} An object detailing the outcome of the processing.
+   * @throws {Error} If a critical error occurs during processing.
    */
   async processDailyEmails(userId, options = {}) {
+    // Check if processing is already in progress for this user.
+    if (this.processingQueue.has(userId)) {
+      logger.warn('Email processing is already in progress for user.', { userId });
+      return { status: 'already_processing', message: 'Processing already in progress.', details: this.processingQueue.get(userId) };
+    }
+
     try {
-      // Prevent duplicate processing
-      if (this.processingQueue.has(userId)) {
-        logger.warn('Email processing already in progress for user', { userId });
-        return { status: 'already_processing' };
-      }
+      this.processingQueue.set(userId, { startedAt: new Date(), stage: 'initiating' });
+      logger.info('Starting daily email processing workflow.', { userId, options });
 
-      this.processingQueue.set(userId, { startedAt: new Date() });
-
-      logger.info('Starting daily email processing', { userId });
-
-      // 1. Fetch recent emails from Gmail
+      // 1. Fetch recent emails
+      this.processingQueue.set(userId, { startedAt: this.processingQueue.get(userId).startedAt, stage: 'fetching_emails' });
       const fetchOptions = {
-        after: options.after || this.getYesterday(),
+        after: options.after || this._getYesterdayDate(),
         maxResults: options.maxResults || 50,
-        includeRead: options.includeRead !== false,
-        excludePromotions: options.excludePromotions !== false,
-        excludeSocial: options.excludeSocial !== false,
+        includeRead: options.includeRead !== false, // Default true
+        excludePromotions: options.excludePromotions !== false, // Default true
+        excludeSocial: options.excludeSocial !== false, // Default true
       };
-
       const rawEmails = await gmailService.fetchRecentEmails(userId, fetchOptions);
 
       if (rawEmails.length === 0) {
-        logger.info('No emails found for processing', { userId });
+        logger.info('No new emails found for daily processing.', { userId });
         this.processingQueue.delete(userId);
-        return { status: 'no_emails', processedCount: 0 };
+        return { status: 'no_emails_found', processedCount: 0, summarizedCount: 0 };
+      }
+      logger.info(`Fetched ${rawEmails.length} raw emails.`, { userId });
+
+      // 2. Filter emails based on user's persona (if available)
+      this.processingQueue.set(userId, { ...this.processingQueue.get(userId), stage: 'filtering_emails' });
+      const user = await User.findById(userId).populate('persona').lean(); // Use lean if user object not modified
+      if (!user) throw new Error(`User not found: ${userId}`);
+
+      const filteredEmails = await this._filterEmailsByPersona(rawEmails, user);
+      logger.info(`Filtered emails down to ${filteredEmails.length} based on persona/rules.`, { userId });
+
+      if (filteredEmails.length === 0) {
+        logger.info('No emails passed filtering for daily processing.', { userId });
+        this.processingQueue.delete(userId);
+        return { status: 'no_relevant_emails', processedCount: 0, summarizedCount: 0, rawEmailCount: rawEmails.length };
       }
 
-      // 2. Filter and prioritize emails based on user persona
-      const user = await User.findById(userId).populate('persona');
-      const filteredEmails = await this.filterEmailsByPersona(rawEmails, user);
+      // 3. Process and store the filtered emails, generate individual summaries
+      this.processingQueue.set(userId, { ...this.processingQueue.get(userId), stage: 'processing_and_summarizing_individual_emails' });
+      const { processedAndStoredEmails, individualSummaries } = await this._processAndSummarizeEmails(userId, filteredEmails, user);
 
-      logger.info('Filtered emails by persona', {
-        userId,
-        originalCount: rawEmails.length,
-        filteredCount: filteredEmails.length,
-      });
-
-      // 3. Process and store emails
-      const processedEmails = [];
-      for (const emailData of filteredEmails) {
-        try {
-          const processedEmail = await this.processAndStoreEmail(userId, emailData);
-          if (processedEmail) {
-            processedEmails.push(processedEmail);
-          }
-        } catch (error) {
-          logger.error('Failed to process individual email', {
-            userId,
-            messageId: emailData.messageId,
-            error: error.message,
-          });
-        }
+      // 4. Generate daily summary from individual summaries
+      let dailySummaryDocument = null;
+      if (individualSummaries.length > 0) {
+        this.processingQueue.set(userId, { ...this.processingQueue.get(userId), stage: 'generating_daily_summary' });
+        dailySummaryDocument = await this._generateAndStoreDailySummary(userId, individualSummaries, user);
+      } else {
+        logger.info('No individual summaries generated, skipping daily summary.', { userId });
       }
 
-      // 4. Generate individual summaries for important emails
-      const emailSummaries = [];
-      for (const email of processedEmails) {
-        if (this.shouldSummarizeEmail(email, user)) {
-          try {
-            const summary = await this.generateEmailSummary(email, user);
-            emailSummaries.push(summary);
-          } catch (error) {
-            logger.error('Failed to generate email summary', {
-              userId,
-              emailId: email._id,
-              error: error.message,
-            });
-          }
-        }
-      }
-
-      // 5. Generate daily summary if we have individual summaries
-      let dailySummary = null;
-      if (emailSummaries.length > 0) {
-        try {
-          dailySummary = await this.generateDailySummary(userId, emailSummaries, user);
-        } catch (error) {
-          logger.error('Failed to generate daily summary', {
-            userId,
-            error: error.message,
-          });
-        }
-      }
-
-      // 6. Update user statistics
-      await this.updateUserStats(userId, processedEmails.length, emailSummaries.length);
-
-      this.processingQueue.delete(userId);
+      // 5. Update user statistics
+      this.processingQueue.set(userId, { ...this.processingQueue.get(userId), stage: 'updating_stats' });
+      await this._updateUserStats(userId, processedAndStoredEmails.length, individualSummaries.length);
 
       const result = {
         status: 'completed',
-        processedCount: processedEmails.length,
-        summarizedCount: emailSummaries.length,
-        dailySummary: dailySummary ? {
-          id: dailySummary._id,
-          content: dailySummary.content.substring(0, 200) + '...',
-          actionItemsCount: dailySummary.actionItems?.length || 0,
-        } : null,
-        processedAt: new Date(),
+        processedEmailCount: processedAndStoredEmails.length,
+        individualSummariesCount: individualSummaries.length,
+        dailySummaryId: dailySummaryDocument?._id,
+        processedAt: new Date().toISOString(),
       };
-
-      logger.info('Daily email processing completed', { userId, ...result });
+      logger.info('Daily email processing completed successfully.', { userId, ...result });
       return result;
 
     } catch (error) {
-      this.processingQueue.delete(userId);
-      logger.error('Daily email processing failed', { userId, error: error.message });
-      throw error;
+      logger.error('Critical error during daily email processing for user:', { userId, message: error.message, stack: error.stack });
+      throw error; // Re-throw to be caught by higher-level error handlers
+    } finally {
+      this.processingQueue.delete(userId); // Ensure user is removed from queue regardless of outcome
     }
   }
 
   /**
-   * Filter emails based on user persona
+   * Processes a batch of emails: stores them and generates individual summaries if applicable.
+   * @private
    */
-  async filterEmailsByPersona(emails, user) {
-    const persona = user.persona;
+  async _processAndSummarizeEmails(userId, emailsToProcess, user) {
+    const processedAndStoredEmails = [];
+    const individualSummaries = [];
+
+    for (const emailData of emailsToProcess) {
+      try {
+        const storedEmail = await this._processAndStoreSingleEmail(userId, emailData);
+        if (storedEmail) {
+          processedAndStoredEmails.push(storedEmail);
+          if (this._shouldSummarizeEmail(storedEmail, user)) { // Pass the Mongoose document
+            const summaryData = await this._generateIndividualEmailSummary(storedEmail, user); // Pass Mongoose doc
+            if (summaryData) {
+              // Attach summary to the email document and save
+              storedEmail.summary = summaryData;
+              await storedEmail.save();
+              individualSummaries.push({ ...summaryData, emailId: storedEmail._id, subject: storedEmail.subject, sender: storedEmail.sender }); // For daily summary context
+            }
+          }
+        }
+      } catch (err) {
+        logger.error('Error processing one email in batch:', { userId, messageId: emailData.messageId, error: err.message });
+      }
+    }
+    return { processedAndStoredEmails, individualSummaries };
+  }
+
+
+  /**
+   * Filters a list of raw emails based on the user's persona or default rules.
+   * @private
+   * @param {Array<object>} emails - Raw emails fetched from Gmail.
+   * @param {User} user - The user document, potentially with populated persona.
+   * @returns {Promise<Array<object>>} Filtered and scored list of emails.
+   */
+  async _filterEmailsByPersona(emails, user) {
+    const persona = user?.persona;
     
     if (!persona) {
-      // No persona - use basic filtering
-      return this.basicEmailFilter(emails);
+      logger.debug(`No persona found for user ${user._id}, using basic filter.`, { userId: user._id });
+      return this._basicEmailFilter(emails);
     }
 
-    const filtered = [];
+    const scoredEmails = emails.map(email => {
+      const score = persona.getEmailScore ? persona.getEmailScore(email) : this._calculateEmailScore(email, persona); // Fallback if method not on lean object
+      return { ...email, personalityScore: score };
+    });
     
-    for (const email of emails) {
-      const score = this.calculateEmailScore(email, persona);
-      
-      if (score >= this.getMinimumScore(user)) {
-        email.personalityScore = score;
-        filtered.push(email);
-      }
-    }
-
-    // Sort by score (highest first) and limit
-    filtered.sort((a, b) => (b.personalityScore || 0) - (a.personalityScore || 0));
-    
-    const maxEmails = this.getMaxEmailsForUser(user);
-    return filtered.slice(0, maxEmails);
-  }
-
-  /**
-   * Calculate email importance score based on persona
-   */
-  calculateEmailScore(email, persona) {
-    let score = 0;
-
-    // Base score for unread emails
-    if (email.isUnread) score += 2;
-
-    // Important label from Gmail
-    if (email.isImportant) score += 3;
-
-    // Check important contacts
-    if (persona.importantContacts && persona.importantContacts.length > 0) {
-      const senderLower = email.sender.toLowerCase();
-      const isImportantContact = persona.importantContacts.some(contact => 
-        senderLower.includes(contact.toLowerCase())
-      );
-      if (isImportantContact) score += 5;
-    }
-
-    // Check keywords in subject and body
-    if (persona.keywords && persona.keywords.length > 0) {
-      const text = `${email.subject} ${email.body}`.toLowerCase();
-      const keywordMatches = persona.keywords.filter(keyword => 
-        text.includes(keyword.toLowerCase())
-      ).length;
-      score += keywordMatches * 2;
-    }
-
-    // Check interests
-    if (persona.interests && persona.interests.length > 0) {
-      const text = `${email.subject} ${email.body}`.toLowerCase();
-      const interestMatches = persona.interests.filter(interest => 
-        text.includes(interest.toLowerCase())
-      ).length;
-      score += interestMatches * 1.5;
-    }
-
-    // Penalize promotional/newsletter emails
-    const subject = email.subject.toLowerCase();
-    const body = email.body.toLowerCase();
-    
-    const promotionalKeywords = ['unsubscribe', 'newsletter', 'promotion', 'offer', 'deal', 'sale'];
-    const hasPromotionalContent = promotionalKeywords.some(keyword => 
-      subject.includes(keyword) || body.includes(keyword)
+    // Filter out emails that don't meet persona criteria (e.g., minimum score, exclude patterns)
+    const relevantEmails = scoredEmails.filter(email =>
+        persona.shouldIncludeEmail ? persona.shouldIncludeEmail(email) : (email.personalityScore >= (this._getMinimumScoreForUser(user) || 0))
     );
+
+    // Sort by score (highest first) and then by date (newest first for tie-breaking)
+    relevantEmails.sort((a, b) => {
+      if (b.personalityScore !== a.personalityScore) {
+        return (b.personalityScore || 0) - (a.personalityScore || 0);
+      }
+      return new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime();
+    });
     
-    if (hasPromotionalContent) score -= 2;
-
-    // Boost for recent emails
-    const hoursOld = (Date.now() - email.receivedAt.getTime()) / (1000 * 60 * 60);
-    if (hoursOld < 6) score += 1;
-
-    return Math.max(0, score);
+    const maxEmails = persona.maxEmailsPerSummary || this._getMaxEmailsForUser(user);
+    return relevantEmails.slice(0, maxEmails);
   }
 
   /**
-   * Basic email filtering when no persona is available
+   * Calculates an importance score for an email based on persona criteria.
+   * This is a simplified scoring logic.
+   * @private
    */
-  basicEmailFilter(emails) {
+  _calculateEmailScore(email, persona) {
+    // Fallback scoring logic if persona.getEmailScore is not available (e.g. persona is a plain object)
+    let score = 0;
+    if (email.isUnread) score += 2;
+    if (email.isImportant) score += 3;
+    // Add more basic scoring rules here if needed
+    if (persona.importantContacts?.some(c => email.sender?.toLowerCase().includes(c.toLowerCase()))) score += 5;
+    logger.silly('Calculated email score (fallback)', { score, emailSubject: email.subject, personaId: persona?._id });
+    return score;
+  }
+
+  /**
+   * Applies basic filtering rules if no persona is available.
+   * @private
+   */
+  _basicEmailFilter(emails) {
     return emails
       .filter(email => {
-        // Exclude obvious promotional content
-        const subject = email.subject.toLowerCase();
-        const promotionalKeywords = ['unsubscribe', 'newsletter', 'no-reply'];
-        return !promotionalKeywords.some(keyword => subject.includes(keyword));
+        const subjectLower = email.subject?.toLowerCase() || '';
+        const senderLower = email.sender?.toLowerCase() || '';
+        const promotionalKeywords = ['unsubscribe', 'newsletter', 'promotion', 'offer'];
+        if (promotionalKeywords.some(kw => subjectLower.includes(kw) || senderLower.includes('no-reply'))) {
+          return false;
+        }
+        return true;
       })
-      .sort((a, b) => {
-        // Sort by importance, then by date
-        if (a.isImportant && !b.isImportant) return -1;
-        if (!a.isImportant && b.isImportant) return 1;
-        return new Date(b.receivedAt) - new Date(a.receivedAt);
-      })
-      .slice(0, 20); // Limit to 20 emails
+      .sort((a, b) => (b.isImportant ? 1 : 0) - (a.isImportant ? 1 : 0) || new Date(b.receivedAt) - new Date(a.receivedAt))
+      .slice(0, 20);
   }
 
   /**
-   * Process and store a single email
+   * Processes and stores a single email in the database.
+   * Avoids duplicates based on messageId and userId.
+   * @private
+   * @param {string} userId - The user's ID.
+   * @param {object} emailData - Raw email data from Gmail service.
+   * @returns {Promise<Email|null>} The saved Email document or null if duplicate/error.
    */
-  async processAndStoreEmail(userId, emailData) {
+  async _processAndStoreSingleEmail(userId, emailData) {
     try {
-      // Check if email already exists
-      const existingEmail = await Email.findOne({
-        userId,
-        messageId: emailData.messageId,
-      });
-
+      const existingEmail = await Email.findOne({ userId, messageId: emailData.messageId });
       if (existingEmail) {
-        logger.debug('Email already exists, skipping', {
-          userId,
-          messageId: emailData.messageId,
-        });
-        return existingEmail;
+        logger.debug('Email already processed and stored, skipping.', { userId, messageId: emailData.messageId });
+        return existingEmail; // Return existing if found
       }
 
-      // Create new email record
       const email = new Email({
         userId,
         messageId: emailData.messageId,
@@ -261,256 +256,255 @@ class EmailProcessingService {
         subject: emailData.subject,
         sender: emailData.sender,
         recipients: emailData.recipients,
-        body: this.cleanEmailBody(emailData.body),
-        htmlBody: emailData.htmlBody,
+        body: this._cleanEmailBody(emailData.body), // Clean body before storing
+        htmlBody: emailData.htmlBody, // Store raw HTML, can be cleaned on display if needed
         snippet: emailData.snippet,
         labels: emailData.labels,
         isImportant: emailData.isImportant,
-        isRead: !emailData.isUnread,
-        receivedAt: emailData.receivedAt,
+        isRead: !emailData.isUnread, // Gmail's isUnread vs our isRead
+        receivedAt: new Date(emailData.receivedAt), // Ensure it's a Date object
         processedAt: new Date(),
-        personalityScore: emailData.personalityScore,
+        personalityScore: emailData.personalityScore || 0,
         attachments: emailData.attachments || [],
       });
-
       await email.save();
-      
-      logger.debug('Email stored successfully', {
-        userId,
-        emailId: email._id,
-        messageId: emailData.messageId,
-      });
-
+      logger.debug('Email stored successfully in DB.', { userId, emailId: email._id });
       return email;
-
     } catch (error) {
-      logger.error('Failed to store email', {
-        userId,
-        messageId: emailData.messageId,
-        error: error.message,
-      });
-      throw error;
+      logger.error('Failed to store email in DB:', { userId, messageId: emailData.messageId, error: error.message });
+      return null; // Return null on error to allow batch processing to continue
     }
   }
 
   /**
-   * Determine if an email should be summarized
+   * Determines if a specific email should be summarized based on its properties and user persona.
+   * @private
+   * @param {Email} emailDoc - The processed Email Mongoose document.
+   * @param {User} user - The user document with populated persona.
+   * @returns {boolean} True if the email should be summarized.
    */
-  shouldSummarizeEmail(email, user) {
-    // Don't summarize very short emails
-    if (email.body.length < 100) return false;
-
-    // Always summarize important emails
-    if (email.isImportant) return true;
-
-    // Summarize emails with high persona score
-    if (email.personalityScore && email.personalityScore >= 5) return true;
-
-    // Summarize unread emails above certain length
-    if (!email.isRead && email.body.length > 300) return true;
-
+  _shouldSummarizeEmail(emailDoc, user) {
+    const persona = user?.persona;
+    if (persona && persona.shouldIncludeEmail && typeof persona.shouldIncludeEmail === 'function') {
+        // If persona has its own logic (e.g. from Persona model methods if not lean())
+        return persona.shouldIncludeEmail(emailDoc);
+    }
+    // Default logic if no specific persona method
+    if (emailDoc.body.length < (persona?.minimumEmailLength || 100)) return false;
+    if (emailDoc.isImportant) return true;
+    if (emailDoc.personalityScore && emailDoc.personalityScore >= (this._getMinimumScoreForUser(user) || 3)) return true;
+    if (!emailDoc.isRead && emailDoc.body.length > 300) return true; // Summarize longer unread emails
     return false;
   }
 
   /**
-   * Generate summary for a single email
+   * Generates an individual summary for a given email using the AI service.
+   * @private
+   * @param {Email} emailDoc - The Email Mongoose document.
+   * @param {User} user - The user document with populated persona.
+   * @returns {Promise<object|null>} The summary data object or null if generation fails.
    */
-  async generateEmailSummary(email, user) {
+  async _generateIndividualEmailSummary(emailDoc, user) {
     try {
-      const emailData = {
-        subject: email.subject,
-        body: email.body,
-        sender: email.sender,
-        receivedAt: email.receivedAt,
-        snippet: email.snippet,
+      const emailDataForAI = {
+        subject: emailDoc.subject,
+        body: emailDoc.body, // Use cleaned body
+        sender: emailDoc.sender,
+        receivedAt: emailDoc.receivedAt,
+        snippet: emailDoc.snippet,
       };
+      const summaryAIResult = await aiService.generateEmailSummary(emailDataForAI, user?.persona, 'individual');
 
-      const persona = user.persona;
-      const summary = await aiService.generateEmailSummary(emailData, persona, 'individual');
-
-      // Store the summary
-      const emailSummary = {
-        emailId: email._id,
-        messageId: email.messageId,
-        subject: email.subject,
-        sender: email.sender,
-        content: summary.content,
-        actionItems: summary.actionItems || [],
-        priority: summary.priority || 'medium',
-        category: summary.category || 'general',
-        sentiment: summary.sentiment || 'neutral',
+      logger.debug('Individual email summary generated by AI.', { emailId: emailDoc._id, userId: user._id });
+      return { // This structure should match the `summary` subdocument in Email model
+        content: summaryAIResult.content,
+        actionItems: summaryAIResult.actionItems || [],
+        priority: summaryAIResult.priority || 'medium',
+        category: summaryAIResult.category || 'general',
+        sentiment: summaryAIResult.sentiment || 'neutral',
         generatedAt: new Date(),
       };
-
-      logger.debug('Email summary generated', {
-        emailId: email._id,
-        summaryLength: summary.content?.length || 0,
-      });
-
-      return emailSummary;
-
     } catch (error) {
-      logger.error('Failed to generate email summary', {
-        emailId: email._id,
-        error: error.message,
-      });
-      throw error;
+      logger.error('Failed to generate individual email summary via AI service:', { emailId: emailDoc._id, error: error.message });
+      return null;
     }
   }
 
   /**
-   * Generate daily summary from individual email summaries
+   * Generates and stores a daily summary from a list of individual email summaries.
+   * @private
+   * @param {string} userId - User's ID.
+   * @param {Array<object>} individualSummaries - Array of generated individual summaries.
+   * @param {User} user - The user document with populated persona.
+   * @returns {Promise<Summary|null>} The saved Daily Summary document or null.
    */
-  async generateDailySummary(userId, emailSummaries, user) {
+  async _generateAndStoreDailySummary(userId, individualSummaries, user) {
     try {
-      const persona = user.persona;
-      const summaryData = emailSummaries.map(summary => ({
-        subject: summary.subject,
-        sender: summary.sender,
-        content: summary.content,
-        actionItems: summary.actionItems,
-        priority: summary.priority,
-        category: summary.category,
-      }));
+      const dailySummaryAIResult = await aiService.generateDailySummary(individualSummaries, user?.persona);
 
-      const dailySummaryContent = await aiService.generateDailySummary(summaryData, persona);
-
-      // Create daily summary record
-      const dailySummary = new Summary({
+      const summaryDoc = new Summary({
         userId,
         type: 'daily',
-        content: dailySummaryContent.content,
-        emailIds: emailSummaries.map(s => s.emailId).filter(Boolean),
-        actionItems: dailySummaryContent.actionItems || [],
-        highlights: dailySummaryContent.highlights || [],
-        categories: dailySummaryContent.categories || {},
-        metadata: {
-          emailCount: emailSummaries.length,
-          generatedAt: new Date(),
-          summaryType: 'daily',
-          ...dailySummaryContent.metadata,
+        content: dailySummaryAIResult.content,
+        emailIds: individualSummaries.map(s => s.emailId).filter(Boolean), // Link to original Email docs
+        actionItems: dailySummaryAIResult.actionItems || [],
+        highlights: dailySummaryAIResult.highlights || [],
+        categories: dailySummaryAIResult.metadata?.categoriesAggregated || {},
+        stats: { // Populate stats based on the day's emails
+            totalEmails: individualSummaries.length,
+            // Other stats like unread, important could be calculated if full email objects are passed
         },
-        createdAt: new Date(),
+        dateRange: { // For a daily summary, this would typically be the day it's generated for
+            start: this._getYesterdayDate(), // Example: summary for "yesterday"
+            end: new Date(this._getYesterdayDate().getTime() + 24 * 60 * 60 * 1000 -1) // End of yesterday
+        },
+        metadata: { // AI generation metadata
+            aiProvider: aiService.provider?.name,
+            modelUsed: aiConfig.getModelConfig('detailed', aiService.provider?.name).model,
+            // processingTimeMs, tokenCount could be added if returned by aiService
+        },
       });
-
-      await dailySummary.save();
-
-      logger.info('Daily summary generated and stored', {
-        userId,
-        summaryId: dailySummary._id,
-        emailCount: emailSummaries.length,
-      });
-
-      return dailySummary;
-
+      await summaryDoc.save();
+      logger.info('Daily summary document stored successfully.', { userId, summaryId: summaryDoc._id });
+      return summaryDoc;
     } catch (error) {
-      logger.error('Failed to generate daily summary', {
-        userId,
-        error: error.message,
-      });
-      throw error;
+      logger.error('Failed to generate or store daily summary:', { userId, error: error.message });
+      return null;
     }
   }
 
   /**
-   * Update user statistics
+   * Updates user's usage statistics.
+   * @private
    */
-  async updateUserStats(userId, processedCount, summarizedCount) {
+  async _updateUserStats(userId, processedEmailCount, generatedSummariesCount) {
     try {
       const user = await User.findById(userId);
       if (user) {
-        await user.incrementUsage('emailsProcessed', processedCount);
-        await user.incrementUsage('summariesGenerated', summarizedCount);
+        if (processedEmailCount > 0) await user.incrementUsage('emailsProcessed', processedEmailCount);
+        if (generatedSummariesCount > 0) await user.incrementUsage('summariesGenerated', generatedSummariesCount);
+        // Could also increment a general 'dailyProcessingRuns' counter
+        logger.info('User stats updated.', { userId, processedEmailCount, generatedSummariesCount });
       }
     } catch (error) {
-      logger.error('Failed to update user stats', { userId, error: error.message });
+      logger.error('Failed to update user statistics:', { userId, error: error.message });
     }
   }
 
   /**
-   * Clean email body text
+   * Cleans email body text by removing excessive whitespace and common signature/footer patterns.
+   * Limits the length of the cleaned body.
+   * @private
+   * @param {string} body - The raw email body text.
+   * @returns {string} The cleaned email body text.
    */
-  cleanEmailBody(body) {
-    if (!body) return '';
-
-    // Remove excessive whitespace
-    let cleaned = body.replace(/\s+/g, ' ').trim();
+  _cleanEmailBody(body) {
+    if (!body || typeof body !== 'string') return '';
+    let cleaned = body.replace(/\s+/g, ' ').trim(); // Normalize whitespace
     
-    // Remove common email signatures and footers
-    const signatureMarkers = [
-      '-- ',
-      'Sent from my',
-      'Get Outlook for',
-      'This email was sent from',
+    // Remove common disclaimers, signatures, marketing footers (examples)
+    const patternsToRemove = [
+      /Sent from my .*/gi,
+      /Get Outlook for .*/gi,
+      /This email was sent from .*/gi,
+      /To unsubscribe, click here.*/gi,
+      /View this email in your browser.*/gi,
+      /If you wish to stop receiving our emails.*/gi,
+      /All rights reserved.*/gi,
+      /Copyright \d{4}.*/gi,
+      /^-{2,}\s*Original Message\s*-{2,}$/gim, // Dashed lines around original message
+      /^>{1,}\s?/gm, // Remove leading '>' from quoted replies
     ];
+    patternsToRemove.forEach(pattern => {
+      cleaned = cleaned.replace(pattern, '');
+    });
     
-    for (const marker of signatureMarkers) {
-      const index = cleaned.toLowerCase().indexOf(marker.toLowerCase());
-      if (index > 0) {
-        cleaned = cleaned.substring(0, index).trim();
-      }
+    // More aggressive signature removal (common patterns)
+    const signatureLines = cleaned.split(/\n-{2,}\n|\n_{2,}\n/); // Split by common signature dividers
+    if (signatureLines.length > 1) {
+      cleaned = signatureLines[0].trim(); // Take content before the first major signature line
     }
 
-    // Limit length
-    if (cleaned.length > 5000) {
-      cleaned = cleaned.substring(0, 5000) + '...';
+    // Limit length to avoid overly long bodies in DB / AI prompts
+    const MAX_CLEANED_BODY_LENGTH = 15000; // Increased limit for cleaned body
+    if (cleaned.length > MAX_CLEANED_BODY_LENGTH) {
+      cleaned = cleaned.substring(0, MAX_CLEANED_BODY_LENGTH) + '... [body truncated]';
     }
-
-    return cleaned;
+    return cleaned.trim();
   }
 
   /**
-   * Get yesterday's date for filtering
+   * Gets the Date object for the start of yesterday.
+   * @private
+   * @returns {Date}
    */
-  getYesterday() {
+  _getYesterdayDate() {
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
-    yesterday.setHours(0, 0, 0, 0);
+    yesterday.setHours(0, 0, 0, 0); // Start of yesterday
     return yesterday;
   }
 
   /**
-   * Get minimum score for email filtering
+   * Determines the minimum relevance score for an email to be processed, based on user's plan.
+   * @private
+   * @param {User} user - The user document.
+   * @returns {number} The minimum score.
    */
-  getMinimumScore(user) {
-    if (user.subscription.plan === 'enterprise') return 1;
-    if (user.subscription.plan === 'pro') return 2;
-    return 3; // Free tier - more selective
+  _getMinimumScoreForUser(user) {
+    // Example: Higher plans might process emails with lower scores (more inclusive)
+    if (user?.subscription?.plan === 'enterprise') return 1;
+    if (user?.subscription?.plan === 'pro') return 2;
+    return 3; // Free tier is more selective
   }
 
   /**
-   * Get maximum emails to process for user
+   * Determines the maximum number of emails to process for a user, based on their plan.
+   * @private
+   * @param {User} user - The user document.
+   * @returns {number} The maximum number of emails.
    */
-  getMaxEmailsForUser(user) {
-    if (user.subscription.plan === 'enterprise') return 100;
-    if (user.subscription.plan === 'pro') return 50;
+  _getMaxEmailsForUser(user) {
+    if (user?.subscription?.plan === 'enterprise') return 100;
+    if (user?.subscription?.plan === 'pro') return 50;
     return 20; // Free tier
   }
 
   /**
-   * Get processing status for user
+   * Retrieves the current processing status for a given user.
+   * @param {string} userId - The ID of the user.
+   * @returns {{status: string, startedAt: Date, duration: number}|null} Processing status or null if not processing.
    */
   getProcessingStatus(userId) {
-    const processing = this.processingQueue.get(userId);
-    if (!processing) return null;
+    const processingEntry = this.processingQueue.get(userId);
+    if (!processingEntry) return null;
 
     return {
-      status: 'processing',
-      startedAt: processing.startedAt,
-      duration: Date.now() - processing.startedAt.getTime(),
+      status: 'processing', // Could be more granular e.g. 'fetching', 'summarizing'
+      stage: processingEntry.stage || 'unknown',
+      startedAt: processingEntry.startedAt,
+      elapsedMilliseconds: Date.now() - processingEntry.startedAt.getTime(),
     };
   }
 
   /**
-   * Process emails on-demand (not scheduled)
+   * Processes emails on-demand. This is a wrapper around `processDailyEmails`
+   * but typically uses a smaller `maxResults` for quicker processing.
+   * @async
+   * @param {string} userId - The user's ID.
+   * @param {object} [options={}] - Options, particularly `maxResults`.
+   * @returns {Promise<object>} Result of the on-demand processing.
    */
   async processEmailsOnDemand(userId, options = {}) {
-    const result = await this.processDailyEmails(userId, {
+    logger.info('Processing emails on-demand.', { userId, options });
+    // Use a smaller default batch size for on-demand requests
+    const onDemandOptions = {
       ...options,
-      maxResults: options.maxResults || 10, // Smaller batch for on-demand
-    });
-
-    return result;
+      maxResults: options.maxResults || 10,
+      // For on-demand, might want to fetch very recent emails, e.g., last few hours
+      after: options.after || new Date(Date.now() - 6 * 60 * 60 * 1000), // Default to last 6 hours
+    };
+    return this.processDailyEmails(userId, onDemandOptions);
   }
 }
 

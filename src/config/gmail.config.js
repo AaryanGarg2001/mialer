@@ -1,24 +1,50 @@
 const { google } = require('googleapis');
 const logger = require('../utils/logger');
 
+/**
+ * @file Gmail API Configuration and Authentication
+ * @module config/gmail
+ * @requires googleapis
+ * @requires ../utils/logger
+ */
+
+/**
+ * Manages Gmail API client configuration, OAuth2 authentication, and token handling.
+ * Reads Google OAuth2 credentials from environment variables.
+ * @class GmailConfig
+ */
 class GmailConfig {
+  /**
+   * Initializes the GmailConfig instance.
+   * Sets Google OAuth2 client ID, client secret, redirect URI, and scopes.
+   * Validates the presence of required environment variables.
+   * @constructor
+   */
   constructor() {
+    /** @member {string} clientId - Google OAuth2 Client ID. */
     this.clientId = process.env.GOOGLE_CLIENT_ID;
+    /** @member {string} clientSecret - Google OAuth2 Client Secret. */
     this.clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    /** @member {string} redirectUri - Google OAuth2 Redirect URI. */
     this.redirectUri = process.env.GOOGLE_REDIRECT_URI;
     
-    // Required scopes for Gmail access
+    /** @member {string[]} scopes - Array of scopes required for Gmail API access. */
     this.scopes = [
-      'https://www.googleapis.com/auth/gmail.readonly',
-      'https://www.googleapis.com/auth/gmail.modify',
-      'https://www.googleapis.com/auth/userinfo.email',
-      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/gmail.readonly',    // View your messages and settings
+      'https://www.googleapis.com/auth/gmail.modify',     // Modify your messages (e.g., mark as read/unread, archive)
+      'https://www.googleapis.com/auth/userinfo.email',   // View your email address
+      'https://www.googleapis.com/auth/userinfo.profile', // View your basic profile info
     ];
 
     // Validate configuration on initialization
     this.validateConfig();
   }
 
+  /**
+   * Validates that all required Google OAuth2 environment variables are set.
+   * Throws an error if any required variable is missing.
+   * @private
+   */
   validateConfig() {
     const requiredEnvVars = [
       'GOOGLE_CLIENT_ID',
@@ -29,15 +55,18 @@ class GmailConfig {
     const missing = requiredEnvVars.filter(envVar => !process.env[envVar]);
     
     if (missing.length > 0) {
-      logger.error('Missing Gmail configuration:', { missing });
-      throw new Error(`Missing required Gmail environment variables: ${missing.join(', ')}`);
+      const errorMessage = `Missing required Gmail environment variables: ${missing.join(', ')}. Please check your .env file.`;
+      logger.error('Gmail configuration validation failed:', { missing });
+      throw new Error(errorMessage);
     }
 
-    logger.info('Gmail configuration validated successfully');
+    logger.info('Gmail configuration validated successfully.');
   }
 
   /**
-   * Create OAuth2 client instance
+   * Creates and returns a Google OAuth2 client instance.
+   * @returns {import('google-auth-library').OAuth2Client} Configured OAuth2 client.
+   * @throws {Error} If client creation fails.
    */
   createOAuth2Client() {
     try {
@@ -46,96 +75,121 @@ class GmailConfig {
         this.clientSecret,
         this.redirectUri
       );
-
       return oauth2Client;
     } catch (error) {
-      logger.error('Failed to create OAuth2 client:', error);
-      throw new Error('Gmail OAuth2 client initialization failed');
+      logger.error('Failed to create Google OAuth2 client:', { message: error.message, stack: error.stack });
+      throw new Error('Gmail OAuth2 client initialization failed. Check credentials and configuration.');
     }
   }
 
   /**
-   * Generate authorization URL
+   * Generates a Google OAuth2 authorization URL.
+   * This URL is used to initiate the consent flow for users.
+   * @param {string} [state=null] - Optional state parameter for CSRF protection or redirect tracking.
+   * @returns {string} The generated authorization URL.
+   * @throws {Error} If URL generation fails.
    */
   generateAuthUrl(state = null) {
     try {
       const oauth2Client = this.createOAuth2Client();
       
-      const authUrl = oauth2Client.generateAuthUrl({
-        access_type: 'offline', // Required for refresh token
-        prompt: 'consent', // Force consent screen to get refresh token
+      const authUrlOptions = {
+        access_type: 'offline', // Required to obtain a refresh token
+        prompt: 'consent',      // Ensures the consent screen is shown, vital for getting a refresh token on first auth
         scope: this.scopes,
-        state: state, // Optional state parameter for CSRF protection
-        include_granted_scopes: true,
-      });
+        include_granted_scopes: true, // Useful for incremental auth, though prompt:consent usually re-requests all
+      };
+      if (state) {
+        authUrlOptions.state = state;
+      }
 
-      logger.info('Generated Gmail authorization URL');
+      const authUrl = oauth2Client.generateAuthUrl(authUrlOptions);
+
+      logger.info('Generated Gmail authorization URL successfully.');
       return authUrl;
     } catch (error) {
-      logger.error('Failed to generate Gmail auth URL:', error);
-      throw new Error('Failed to generate Gmail authorization URL');
+      logger.error('Failed to generate Gmail auth URL:', { message: error.message, stack: error.stack });
+      throw new Error('Failed to generate Gmail authorization URL.');
     }
   }
 
   /**
-   * Exchange authorization code for tokens
+   * Exchanges an authorization code (obtained from user consent) for access and refresh tokens.
+   * @async
+   * @param {string} code - The authorization code.
+   * @returns {Promise<import('google-auth-library').Credentials>} Object containing access_token, refresh_token, expiry_date, etc.
+   * @throws {Error} If token exchange fails.
    */
   async exchangeCodeForTokens(code) {
     try {
       const oauth2Client = this.createOAuth2Client();
-      
       const { tokens } = await oauth2Client.getToken(code);
       
-      logger.info('Successfully exchanged code for tokens', {
+      if (!tokens.refresh_token) {
+        logger.warn('Refresh token not received. This might happen if it is not the first time the user grants consent or if prompt:consent was not used.');
+      }
+      logger.info('Successfully exchanged authorization code for tokens.', {
         hasAccessToken: !!tokens.access_token,
-        hasRefreshToken: !!tokens.refresh_token,
-        expiresIn: tokens.expires_in,
+        hasRefreshToken: !!tokens.refresh_token, // Log if refresh token was received
+        expiresIn: tokens.expiry_date, // Log expiry
       });
 
       return tokens;
     } catch (error) {
-      logger.error('Failed to exchange code for tokens:', error);
-      throw new Error('Failed to exchange authorization code for tokens');
+      logger.error('Failed to exchange authorization code for tokens:', { message: error.message, stack: error.stack, codeUsed: code ? 'yes' : 'no' });
+      throw new Error('Failed to exchange authorization code for tokens. The code might be invalid or expired.');
     }
   }
 
   /**
-   * Refresh access token using refresh token
+   * Refreshes an expired access token using a refresh token.
+   * @async
+   * @param {string} refreshToken - The refresh token.
+   * @returns {Promise<import('google-auth-library').Credentials>} New credentials, including a new access_token.
+   * @throws {Error} If token refresh fails (e.g., refresh token revoked or invalid).
    */
   async refreshAccessToken(refreshToken) {
+    if (!refreshToken) {
+      logger.error('refreshAccessToken called without a refreshToken.');
+      throw new Error('Refresh token is required to refresh the access token.');
+    }
     try {
       const oauth2Client = this.createOAuth2Client();
-      oauth2Client.setCredentials({
-        refresh_token: refreshToken,
-      });
+      oauth2Client.setCredentials({ refresh_token: refreshToken });
 
-      const { credentials } = await oauth2Client.refreshAccessToken();
+      const { credentials } = await oauth2Client.refreshAccessToken(); // `credentials` contains the new access_token
       
-      logger.info('Successfully refreshed access token');
-      return credentials;
+      logger.info('Successfully refreshed Google access token.');
+      return credentials; // Contains new access_token, potentially new expiry_date
     } catch (error) {
-      logger.error('Failed to refresh access token:', error);
-      throw new Error('Failed to refresh access token');
+      logger.error('Failed to refresh Google access token:', { message: error.message, stack: error.stack, refreshTokenUsed: refreshToken ? 'yes' : 'no' });
+      // Common errors include 'invalid_grant' if the refresh token is revoked or expired.
+      throw new Error('Failed to refresh access token. The refresh token might be invalid or revoked.');
     }
   }
 
   /**
-   * Get user info from Google
+   * Retrieves user profile information from Google using an access token.
+   * @async
+   * @param {string} accessToken - The user's access token.
+   * @returns {Promise<object>} User profile data (id, email, name, avatar, verified_email).
+   * @throws {Error} If fetching user info fails.
    */
   async getUserInfo(accessToken) {
+    if (!accessToken) {
+      logger.error('getUserInfo called without an accessToken.');
+      throw new Error('Access token is required to get user info.');
+    }
     try {
       const oauth2Client = this.createOAuth2Client();
-      oauth2Client.setCredentials({
-        access_token: accessToken,
-      });
+      oauth2Client.setCredentials({ access_token: accessToken });
 
       const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
       const { data } = await oauth2.userinfo.get();
 
-      logger.info('Retrieved user info from Google', {
-        email: data.email,
-        hasName: !!data.name,
-        hasAvatar: !!data.picture,
+      logger.info('Retrieved user info from Google successfully.', {
+        email: data.email, // For logging privacy, consider logging only data.id or a hash
+        userId: data.id,
       });
 
       return {
@@ -146,95 +200,121 @@ class GmailConfig {
         verified_email: data.verified_email,
       };
     } catch (error) {
-      logger.error('Failed to get user info:', error);
-      throw new Error('Failed to retrieve user information from Google');
+      logger.error('Failed to get user info from Google:', { message: error.message, stack: error.stack });
+      throw new Error('Failed to retrieve user information from Google. The access token might be invalid or expired.');
     }
   }
 
   /**
-   * Create Gmail API client with user credentials
+   * Creates a Gmail API client instance, authenticated with the user's tokens.
+   * @param {string} accessToken - The user's access token.
+   * @param {string} [refreshToken] - Optional. The user's refresh token. Recommended for long-lived access.
+   * @returns {import('googleapis').gmail_v1.Gmail} Authenticated Gmail API client.
+   * @throws {Error} If client creation fails.
    */
   createGmailClient(accessToken, refreshToken) {
+    if (!accessToken) {
+      logger.error('createGmailClient called without an accessToken.');
+      throw new Error('Access token is required to create Gmail client.');
+    }
     try {
       const oauth2Client = this.createOAuth2Client();
-      oauth2Client.setCredentials({
-        access_token: accessToken,
-        refresh_token: refreshToken,
-      });
+      const credentials = { access_token: accessToken };
+      if (refreshToken) {
+        credentials.refresh_token = refreshToken;
+      }
+      oauth2Client.setCredentials(credentials);
 
       const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
       
+      logger.debug('Gmail API client created successfully.');
       return gmail;
     } catch (error) {
-      logger.error('Failed to create Gmail client:', error);
-      throw new Error('Failed to create Gmail API client');
+      logger.error('Failed to create Gmail API client:', { message: error.message, stack: error.stack });
+      throw new Error('Failed to create Gmail API client.');
     }
   }
 
   /**
-   * Validate access token
+   * Validates an access token by attempting to retrieve token information.
+   * @async
+   * @param {string} accessToken - The access token to validate.
+   * @returns {Promise<boolean>} True if the token is valid, false otherwise.
    */
   async validateAccessToken(accessToken) {
+    if (!accessToken) return false;
     try {
       const oauth2Client = this.createOAuth2Client();
-      oauth2Client.setCredentials({
-        access_token: accessToken,
-      });
-
-      const tokenInfo = await oauth2Client.getAccessToken();
-      return !!tokenInfo.token;
+      // No need to set credentials here, getAccessTokenInfo is a method of google.auth.OAuth2
+      const tokenInfo = await oauth2Client.getTokenInfo(accessToken);
+      // A valid token will return info like expiry_date, scope, etc.
+      // An expired or invalid token will throw an error.
+      return !!tokenInfo && !!tokenInfo.expiry_date && tokenInfo.expiry_date > Date.now();
     } catch (error) {
-      logger.warn('Access token validation failed:', error.message);
+      logger.warn('Google access token validation failed:', { message: error.message });
       return false;
     }
   }
 
   /**
-   * Revoke tokens (disconnect account)
+   * Revokes all tokens (access and refresh) associated with the provided access token.
+   * This effectively disconnects the application from the user's Google account.
+   * @async
+   * @param {string} accessToken - The user's access token whose associated tokens should be revoked.
+   * @returns {Promise<boolean>} True if revocation was successful.
+   * @throws {Error} If token revocation fails.
    */
   async revokeTokens(accessToken) {
+    if (!accessToken) {
+      logger.error('revokeTokens called without an accessToken.');
+      throw new Error('Access token is required to revoke credentials.');
+    }
     try {
       const oauth2Client = this.createOAuth2Client();
-      oauth2Client.setCredentials({
-        access_token: accessToken,
-      });
-
-      await oauth2Client.revokeCredentials();
-      logger.info('Successfully revoked Gmail tokens');
-      
+      // It's more robust to revoke using the token itself, rather than just setting it on the client.
+      // The `revokeToken` method is appropriate here.
+      await oauth2Client.revokeToken(accessToken);
+      logger.info('Successfully revoked Gmail tokens.');
       return true;
     } catch (error) {
-      logger.error('Failed to revoke Gmail tokens:', error);
-      throw new Error('Failed to revoke Gmail access');
+      logger.error('Failed to revoke Gmail tokens:', { message: error.message, stack: error.stack });
+      // Error might occur if the token is already invalid or other issues.
+      throw new Error('Failed to revoke Gmail access. The token might already be invalid.');
     }
   }
 
   /**
-   * Get scope descriptions for user-friendly display
+   * Provides a map of OAuth scopes to user-friendly descriptions.
+   * Useful for displaying consent information to users.
+   * @returns {object<string, string>} A map where keys are scope URLs and values are their descriptions.
    */
   getScopeDescriptions() {
     return {
-      'https://www.googleapis.com/auth/gmail.readonly': 'Read your Gmail messages and settings',
-      'https://www.googleapis.com/auth/gmail.modify': 'Manage your Gmail messages (mark as read/unread, add labels)',
-      'https://www.googleapis.com/auth/userinfo.email': 'View your email address',
-      'https://www.googleapis.com/auth/userinfo.profile': 'View your basic profile information',
+      'https://www.googleapis.com/auth/gmail.readonly': 'Read your Gmail messages and settings.',
+      'https://www.googleapis.com/auth/gmail.modify': 'Manage your Gmail messages (e.g., mark as read/unread, archive).',
+      'https://www.googleapis.com/auth/userinfo.email': 'View your email address.',
+      'https://www.googleapis.com/auth/userinfo.profile': 'View your basic profile information (name, picture).',
     };
   }
 
   /**
-   * Check if all required scopes are granted
+   * Validates if a list of granted scopes includes all scopes required by this configuration.
+   * @param {string[]} grantedScopes - An array of scopes granted by the user.
+   * @returns {boolean} True if all required scopes are present, false otherwise.
    */
   validateScopes(grantedScopes) {
-    const requiredScopes = new Set(this.scopes);
-    const granted = new Set(grantedScopes);
+    if (!grantedScopes || grantedScopes.length === 0) return false;
+
+    const requiredScopesSet = new Set(this.scopes);
+    const grantedScopesSet = new Set(grantedScopes);
     
-    for (const scope of requiredScopes) {
-      if (!granted.has(scope)) {
-        logger.warn('Missing required scope:', scope);
+    for (const scope of requiredScopesSet) {
+      if (!grantedScopesSet.has(scope)) {
+        logger.warn('Scope validation failed: Missing required scope.', { missingScope: scope });
         return false;
       }
     }
-    
+    logger.info('All required scopes are present.');
     return true;
   }
 }
