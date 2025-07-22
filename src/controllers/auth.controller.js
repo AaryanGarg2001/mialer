@@ -410,6 +410,85 @@ class AuthController {
       throw new Error(`Token verification failed: ${error.message}`);
     }
   }
+
+
+/**
+ * Validate Chrome Extension Token
+ * @method validateExtensionToken
+ * @route POST /api/v1/auth/validate-token
+ * @access Public (but requires valid token)
+ */
+validateExtensionToken = asyncHandler(async (req, res) => {
+  try {
+    const { token } = req.body;
+    
+    if (!token) {
+      return errorResponse(res, 'Token is required', 400);
+    }
+    
+    // Verify token with Google
+    const response = await fetch(`https://www.googleapis.com/oauth2/v1/tokeninfo?access_token=${token}`);
+    
+    if (!response.ok) {
+      return errorResponse(res, 'Invalid token', 401);
+    }
+    
+    const tokenInfo = await response.json();
+    
+    // Get user info from Google
+    const userInfo = await gmailConfig.getUserInfo(token);
+    
+    // Find or create user in database
+    let user = await User.findOne({ googleId: userInfo.id });
+    
+    if (!user) {
+      user = new User({
+        googleId: userInfo.id,
+        email: userInfo.email,
+        name: userInfo.name,
+        avatar: userInfo.avatar,
+        gmailProvider: {
+          connected: true,
+          email: userInfo.email,
+          connectedAt: new Date(),
+          lastSyncAt: new Date()
+        }
+      });
+      await user.save();
+    } else {
+      // Update last sync
+      user.gmailProvider.lastSyncAt = new Date();
+      await user.save();
+    }
+    
+    // Generate JWT for backend API calls
+    const jwtToken = jwt.sign(
+      { 
+        id: user._id, 
+        email: user.email,
+        googleId: user.googleId 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+    );
+    
+    return successResponse(res, {
+      user: {
+        id: user._id,
+        email: user.email,
+        name: user.name,
+        avatar: user.avatar
+      },
+      jwtToken,
+      googleToken: token,
+      expiresIn: tokenInfo.expires_in
+    }, 'Token validated successfully');
+    
+  } catch (error) {
+    logger.error('Token validation error:', error);
+    return errorResponse(res, 'Token validation failed', 500);
+  }
+});
 }
 
 module.exports = new AuthController();

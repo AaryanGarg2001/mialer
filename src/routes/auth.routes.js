@@ -162,3 +162,31 @@ router.post('/gmail/test-connection', authenticate, requireGmail, asyncHandler(a
 }));
 
 module.exports = router;
+
+router.post('/sync', authenticate, asyncHandler(async (req, res) => {
+  const { successResponse } = require('../utils/response');
+  const { userProfile, extensionId } = req.body;
+  
+  try {
+    // Update user profile if provided
+    if (userProfile) {
+      const user = await User.findById(req.user.id);
+      if (user) {
+        user.extensionId = extensionId;
+        user.lastSyncAt = new Date();
+        await user.save();
+      }
+    }
+    
+    return successResponse(res, {
+      synced: true,
+      user: req.user
+    }, 'Extension synced successfully');
+    
+  } catch (error) {
+    logger.error('Extension sync error:', error);
+    return errorResponse(res, 'Failed to sync extension', 500);
+  }
+}));
+
+router.post('/validate-token', authController.validateExtensionToken);

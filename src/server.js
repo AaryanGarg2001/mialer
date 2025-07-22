@@ -82,18 +82,30 @@ class Server {
     // Configure CORS
     const corsOptions = {
       origin: (origin, callback) => {
-        const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [`http://localhost:${this.port}`, 'http://localhost:3001']; // Example: allow local dev frontend
-        // Allow requests with no origin (like mobile apps, curl, Postman) or if origin is in allowed list
-        if (!origin || allowedOrigins.includes(origin)) {
+        const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [];
+        
+        // Allow Chrome extensions
+        const isChromeExtension = origin && origin.startsWith('chrome-extension://');
+        
+        // Allow requests with no origin (like mobile apps, curl, Postman)
+        // or if origin is in allowed list or is a chrome extension
+        if (!origin || allowedOrigins.includes(origin) || isChromeExtension) {
           callback(null, true);
         } else {
           logger.warn(`CORS: Blocked origin - ${origin}`);
           callback(new Error('This origin is not allowed by CORS policy.'));
         }
       },
-      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'], // Standard methods
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'], // Common headers
-      credentials: true, // If you need to handle cookies or auth headers from frontend
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+      allowedHeaders: [
+        'Content-Type', 
+        'Authorization', 
+        'X-Requested-With',
+        'X-Extension-ID', // Custom header for extension identification
+        'X-Chrome-Extension'
+      ],
+      credentials: true,
+      optionsSuccessStatus: 200 // For legacy browser support
     };
     this.app.use(cors(corsOptions));
 
